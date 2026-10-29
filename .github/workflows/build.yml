@@ -1,0 +1,19 @@
+name: macOS build and offline checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: bash scripts/build.sh
+      - name: Offline checks
+        run: bash scripts/test.sh
+      - name: Package local development build
+        run: ditto -c -k --sequesterRsrc --keepParent "build/Brother Drop Print.app" "build/BrotherDropPrint.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BrotherDropPrint-macos-development
+          path: build/BrotherDropPrint.zip
