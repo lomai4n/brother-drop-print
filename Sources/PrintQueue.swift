@@ -5,6 +5,7 @@ enum PrintJobState: String {
     case waiting = "待处理"
     case preparing = "转换中"
     case sending = "发送中"
+    case flipping = "等待翻面"
     case sent = "已发送"
     case printed = "已出纸"
     case failed = "需检查"
@@ -59,7 +60,10 @@ final class CancellationToken {
 }
 
 enum PrintBatch {
+    /// `flip` is called between the two passes of a manual duplex job with the front page count;
+    /// it blocks until the user has turned the stack over and returns false to stop.
     static func run(_ tasks: [PrintTask], encoder: URL,
+                    flip: (UUID, Int) -> Bool = { _, _ in true },
                     event: (PrintBatchEvent) -> Void) throws {
         // Validate every job's options before generating or sending the first job.
         for task in tasks { try task.options.validate(pageCount: task.document.pageCount) }
@@ -75,7 +79,20 @@ enum PrintBatch {
                                      interface: task.options.interface) {
                     event(.progress(task.id, $0))
                 }
-                event(.sent(task.id, prepared.sheets))
+                var sheets = prepared.sheets
+                if let back = prepared.back {
+                    event(.state(task.id, .flipping))
+                    guard flip(task.id, prepared.sheets) else {
+                        throw PrintFailure(message: "已取消背面，正面 \(prepared.sheets) 页已发送。")
+                    }
+                    event(.state(task.id, .sending))
+                    try PrintEngine.send(back.dataURL, host: task.options.host, port: task.options.port,
+                                         interface: task.options.interface) {
+                        event(.progress(task.id, $0))
+                    }
+                    sheets += back.sheets
+                }
+                event(.sent(task.id, sheets))
             } catch {
                 event(.failed(task.id, error.localizedDescription))
                 throw error

@@ -124,11 +124,12 @@ rememberedSetup.density = 3
 rememberedSetup.save(preferencesStore)
 expect(PageSetup.saved(preferencesStore) == rememberedSetup, "page setup is remembered")
 expect(PrintPreset.load(preferencesStore) == PrintPreset.builtIn &&
-       PrintPreset.builtIn.map(\.name) == ["标准", "草稿", "省墨"], "built-in presets when none are saved")
+       PrintPreset.builtIn.map(\.name) == ["标准", "2 合 1", "草稿", "省墨", "手动双面"],
+       "built-in presets when none are saved")
 var presetList = try PrintPreset.saving(PrintPreset(name: "  讲义 ", setup: rememberedSetup), into: PrintPreset.builtIn)
-expect(presetList.count == 4 && presetList[3].name == "讲义", "a new preset is appended with a trimmed name")
+expect(presetList.count == 6 && presetList[5].name == "讲义", "a new preset is appended with a trimmed name")
 presetList = try PrintPreset.saving(PrintPreset(name: "草稿", setup: rememberedSetup), into: presetList)
-expect(presetList.count == 4 && presetList[1].setup == rememberedSetup, "a preset with the same name is replaced")
+expect(presetList.count == 6 && presetList[2].setup == rememberedSetup, "a preset with the same name is replaced")
 expect(rejected { _ = try PrintPreset.saving(PrintPreset(name: "  ", setup: PageSetup()), into: presetList) },
        "an empty preset name is rejected")
 PrintPreset.store(presetList, preferencesStore)
@@ -522,4 +523,161 @@ try statusDefaults.save(to: preferencesStore)
 let reloadedStatus = PrinterPreferences(defaults: preferencesStore)
 expect(reloadedStatus.statusMode == .snmp && reloadedStatus.snmpPort == 10161, "status settings are saved")
 
-print("Core checks passed: drag state, settings, file receipts, PDF/PNG rendering, TCP binding, batch delivery and printer status.")
+
+// Pages per sheet and manual duplex.
+let a4Sheet = CGSize(width: 579, height: 818)
+let a4Page = CGSize(width: 595, height: 842)
+let twoUp = SheetGrid.best(count: 2, sheet: a4Sheet, page: a4Page)
+expect(twoUp.columns == 2 && twoUp.rows == 1 && twoUp.rotated, "2 in 1 turns the sheet for two large portrait pages")
+for (count, side) in [(4, 2), (9, 3), (16, 4)] {
+    let grid = SheetGrid.best(count: count, sheet: a4Sheet, page: a4Page)
+    expect(grid.columns == side && grid.rows == side && !grid.rotated, "\(count) in 1 is an upright square grid")
+}
+let square = SheetGrid.best(count: 4, sheet: a4Sheet, page: a4Page)
+let topLeft = square.cell(0, order: .rightThenDown)
+expect(topLeft.minX == 0 && topLeft.maxY == 818, "the first page starts at the top left")
+expect(square.cell(1, order: .rightThenDown).minX > 0 && square.cell(1, order: .rightThenDown).maxY == 818,
+       "left to right, then down")
+expect(square.cell(1, order: .downThenRight).minX == 0 && square.cell(1, order: .downThenRight).maxY < 818,
+       "top to bottom, then right")
+expect(square.cell(0, order: .leftThenDown).minX > 0 && square.cell(0, order: .downThenLeft).minX > 0,
+       "right-to-left orders start at the top right")
+
+var twoUpSetup = PageSetup()
+twoUpSetup.layout = 2
+let twoUpRaster = Array(try PrintEngine.raster(document, pages: [1, 2], rotate: false, fit: true, setup: twoUpSetup)
+    .dropFirst(header.count))
+func blackInColumn(_ bits: [UInt8], _ x: Int) -> Int {
+    (0..<PageSetup().height).filter { bits[$0 * PageSetup().rowBytes + x / 8] & UInt8(0x80 >> (x % 8)) != 0 }.count
+}
+// Each test page has a black band along its top; turned pages put their tops at the sheet's left edge.
+expect(blackInColumn(twoUpRaster, 200) > 2000 && blackInColumn(twoUpRaster, PageSetup().width - 200) == 0,
+       "2 in 1 pages are turned with their tops on the left")
+expect(rejected { _ = try PrintEngine.raster(document, pages: [1, 2], rotate: false, fit: true, setup: PageSetup()) },
+       "one page per sheet takes exactly one page")
+
+var duplexSetup = PageSetup()
+duplexSetup.manualDuplex = true
+let decoder = JSONDecoder()
+let legacyPreset = try decoder.decode(PrintPreset.self, from: Data(
+    #"{"name":"旧预设","setup":{"paper":"A5","quality":"draft","media":"PLAIN","density":0}}"#.utf8))
+expect(legacyPreset.setup.paper == .a5 && legacyPreset.setup.layout == 1 && !legacyPreset.setup.manualDuplex,
+       "presets saved before layouts existed still load")
+expect(rejected { _ = try decoder.decode(PageSetup.self, from: Data(#"{"layout":3}"#.utf8)) },
+       "an unsupported pages-per-sheet value is rejected")
+expect(duplexSetup.summary.contains("手动双面") && twoUpSetup.summary.contains("2 合 1"), "summary names the layout")
+
+if CommandLine.arguments.count > 1 {
+    let encoder = URL(fileURLWithPath: CommandLine.arguments[1])
+    func pages(_ url: URL) throws -> Int {
+        let data = try Data(contentsOf: url)
+        var count = 0
+        var range = data.startIndex..<data.endIndex
+        while let found = data.range(of: Data("1030M\u{0c}".utf8), in: range) {
+            count += 1
+            range = found.upperBound..<data.endIndex
+        }
+        return count
+    }
+    var options = valid
+    options.setup = twoUpSetup
+    let twoUpJob = try PrintEngine.prepare(document, options: options, encoder: encoder, progress: { _ in })
+    let twoUpPages = try pages(twoUpJob.dataURL)
+    expect(twoUpJob.sheets == 1 && twoUpJob.back == nil && twoUpPages == 1, "two pages print on one sheet")
+    twoUpJob.remove()
+
+    let threePages = folder.appendingPathComponent("three.pdf")
+    var threeBox = CGRect(x: 0, y: 0, width: 595, height: 842)
+    let threeContext = CGContext(consumer: CGDataConsumer(url: threePages as CFURL)!, mediaBox: &threeBox, nil)!
+    for _ in 0..<3 { threeContext.beginPDFPage(nil); threeContext.endPDFPage() }
+    threeContext.closePDF()
+    let three = try PrintDocument(url: threePages)
+    options = PrintOptions(host: "192.0.2.10", port: 9100, copies: 2, firstPage: 1, lastPage: 3,
+                           rotate: false, fit: true, setup: duplexSetup)
+    let duplexJob = try PrintEngine.prepare(three, options: options, encoder: encoder, progress: { _ in })
+    // Per copy: fronts 1 and 3, backs 2 and a blank, so every copy ends on a complete sheet.
+    let frontPages = try pages(duplexJob.dataURL)
+    let backPages = try duplexJob.back.map { try pages($0.dataURL) }
+    expect(duplexJob.sheets == 4 && duplexJob.back?.sheets == 4 && frontPages == 4 && backPages == 4,
+           "manual duplex pads each copy to whole sheets")
+    duplexJob.remove()
+    options = PrintOptions(host: "192.0.2.10", port: 9100, copies: 1, firstPage: 1, lastPage: 1,
+                           rotate: false, fit: true, setup: duplexSetup)
+    let singleSheet = try PrintEngine.prepare(three, options: options, encoder: encoder, progress: { _ in })
+    expect(singleSheet.back == nil && singleSheet.sheets == 1, "a single sheet needs no second pass")
+    singleSheet.remove()
+
+    func loopbackListener() -> (descriptor: Int32, port: Int) {
+        let listener = socket(AF_INET, SOCK_STREAM, 0)
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        _ = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        listen(listener, 4)
+        var size = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(listener, $0, &size) }
+        }
+        return (listener, Int(UInt16(bigEndian: address.sin_port)))
+    }
+    func drain(_ listener: Int32, connections: Int, done: DispatchSemaphore, into counter: @escaping (Int) -> Void) {
+        DispatchQueue.global().async {
+            for _ in 0..<connections {
+                let peer = accept(listener, nil, nil)
+                guard peer >= 0 else { break }
+                var chunk = [UInt8](repeating: 0, count: 4096)
+                while recv(peer, &chunk, chunk.count, 0) > 0 {}
+                close(peer)
+                counter(1)
+            }
+            done.signal()
+        }
+    }
+    let duplexPrinter = loopbackListener()
+    let duplexDone = DispatchSemaphore(value: 0)
+    var duplexConnections = 0
+    drain(duplexPrinter.descriptor, connections: 2, done: duplexDone) { duplexConnections += $0 }
+    let duplexFile = QueuedPrintFile(document: document, setup: duplexSetup)
+    var duplexConnection = PrinterPreferences(defaults: preferencesStore)
+    duplexConnection.host = "127.0.0.1"
+    duplexConnection.port = duplexPrinter.port
+    duplexConnection.interface = ""
+    var flips: [Int] = []
+    var states: [PrintJobState] = []
+    var duplexSent = 0
+    try PrintBatch.run([duplexFile.task(connection: duplexConnection)], encoder: encoder, flip: { _, fronts in
+        flips.append(fronts)
+        return true
+    }) { event in
+        if case .state(_, let state) = event { states.append(state) }
+        if case .sent(_, let sheets) = event { duplexSent = sheets }
+    }
+    expect(duplexDone.wait(timeout: .now() + 10) == .success && duplexConnections == 2,
+           "fronts and backs go out as two print jobs")
+    expect(flips == [1] && states.contains(.flipping) && duplexSent == 2,
+           "the batch waits for the flip between passes and counts both sides")
+    close(duplexPrinter.descriptor)
+
+    let cancelPrinter = loopbackListener()
+    let cancelDone = DispatchSemaphore(value: 0)
+    var cancelConnections = 0
+    drain(cancelPrinter.descriptor, connections: 1, done: cancelDone) { cancelConnections += $0 }
+    duplexConnection.port = cancelPrinter.port
+    var cancelSent = false
+    expect(rejected {
+        try PrintBatch.run([duplexFile.task(connection: duplexConnection)], encoder: encoder,
+                           flip: { _, _ in false }) { event in
+            if case .sent = event { cancelSent = true }
+        }
+    }, "cancelling the flip stops the batch")
+    expect(cancelDone.wait(timeout: .now() + 10) == .success && cancelConnections == 1 && !cancelSent,
+           "only the fronts were sent")
+    close(cancelPrinter.descriptor)
+}
+
+print("Core checks passed: drag state, settings, file receipts, PDF/PNG rendering, TCP binding, batch delivery, printer status, layouts and manual duplex.")

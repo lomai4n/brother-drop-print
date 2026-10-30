@@ -43,6 +43,9 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let mediaPopup = NSPopUpButton()
     private let densityPopup = NSPopUpButton()
     private let presetPopup = NSPopUpButton()
+    private let layoutPopup = NSPopUpButton()
+    private let orderPopup = NSPopUpButton()
+    private let duplex = NSButton(checkboxWithTitle: "手动双面（先印正面，翻面后印背面）", target: nil, action: nil)
     private let setupSummary = NSTextField(labelWithString: "")
     private var selectedButton: NSButton!
     private var allButton: NSButton!
@@ -306,6 +309,18 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         setupRow.spacing = 10
         root.addArrangedSubview(setupRow)
         setupRow.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        layoutPopup.addItems(withTitles: PageSetup.layouts.map { "\($0) 合 1" })
+        layoutPopup.setAccessibilityLabel("每张纸的页数")
+        orderPopup.addItems(withTitles: LayoutOrder.allCases.map(\.label))
+        orderPopup.setAccessibilityLabel("页面排列顺序")
+        for control in [layoutPopup, orderPopup, duplex] as [NSControl] {
+            control.target = self
+            control.action = #selector(setupChanged)
+        }
+        let layoutRow = NSStackView(views: [NSTextField(labelWithString: "版式"), layoutPopup, orderPopup, duplex])
+        layoutRow.spacing = 10
+        root.addArrangedSubview(layoutRow)
+        layoutRow.heightAnchor.constraint(equalToConstant: 26).isActive = true
         status.font = .systemFont(ofSize: 12)
         status.maximumNumberOfLines = 2
         status.preferredMaxLayoutWidth = 980
@@ -512,6 +527,9 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         setup.quality = PrintQuality.allCases[max(qualityPopup.indexOfSelectedItem, 0)]
         setup.media = MediaType.allCases[max(mediaPopup.indexOfSelectedItem, 0)]
         setup.density = Array(PageSetup.densityRange)[max(densityPopup.indexOfSelectedItem, 0)]
+        setup.layout = PageSetup.layouts[max(layoutPopup.indexOfSelectedItem, 0)]
+        setup.layoutOrder = LayoutOrder.allCases[max(orderPopup.indexOfSelectedItem, 0)]
+        setup.manualDuplex = duplex.state == .on
         return setup
     }
 
@@ -520,6 +538,10 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         qualityPopup.selectItem(at: PrintQuality.allCases.firstIndex(of: setup.quality) ?? 0)
         mediaPopup.selectItem(at: MediaType.allCases.firstIndex(of: setup.media) ?? 0)
         densityPopup.selectItem(at: Array(PageSetup.densityRange).firstIndex(of: setup.density) ?? 6)
+        layoutPopup.selectItem(at: PageSetup.layouts.firstIndex(of: setup.layout) ?? 0)
+        orderPopup.selectItem(at: LayoutOrder.allCases.firstIndex(of: setup.layoutOrder) ?? 0)
+        duplex.state = setup.manualDuplex ? .on : .off
+        updateControls()
         setupSummary.stringValue = "\(setup.summary) · 黑白单面"
         let list = PrintPreset.load()
         presetPopup.removeAllItems()
@@ -642,7 +664,9 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         NSApp.activate(ignoringOtherApps: true)
+        flash.holdOpen = true
         panel.begin { [weak self] result in
+            self?.flash.holdOpen = false
             if result == .OK { self?.accept(panel.urls, intoFlash: true) }
         }
     }
@@ -682,7 +706,9 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
                 var sent: [(id: UUID, sheets: Int)] = []
                 var failure: Error?
                 do {
-                    try PrintBatch.run(tasks, encoder: encoder) { event in
+                    try PrintBatch.run(tasks, encoder: encoder, flip: { id, fronts in
+                        self?.askToFlip(id, fronts: fronts) ?? false
+                    }) { event in
                         if case .sent(let id, let sheets) = event { sent.append((id, sheets)) }
                         DispatchQueue.main.async { self?.handle(event) }
                     }
@@ -722,6 +748,31 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
         reloadList()
         flash.reloadResult()
+    }
+
+    /// Called on the batch thread; waits for the user's answer on the main thread.
+    private func askToFlip(_ id: UUID, fronts: Int) -> Bool {
+        let answered = DispatchSemaphore(value: 0)
+        var proceed = false
+        DispatchQueue.main.async { [weak self] in
+            let name = self?.jobs.first { $0.id == id }?.document.url.lastPathComponent ?? "文档"
+            self?.report("正面已发送，等待翻面后打印背面。")
+            let alert = NSAlert()
+            alert.messageText = "正面已发送，请翻面放纸"
+            alert.informativeText = """
+            “\(name)”的正面共 \(fronts) 页。等打印机出完纸后：
+            1. 取出整叠已打印的纸，不要打乱顺序；
+            2. 左右翻面，让印好的一面朝上，纸张上下方向保持不变；
+            3. 放回纸盒，再点“打印背面”。
+            """
+            alert.addButton(withTitle: "打印背面")
+            alert.addButton(withTitle: "取消背面")
+            NSApp.activate(ignoringOtherApps: true)
+            proceed = alert.runModal() == .alertFirstButtonReturn
+            answered.signal()
+        }
+        answered.wait()
+        return proceed
     }
 
     private func confirmPrinted(baseline: PrinterStatusReport, sent: [(id: UUID, sheets: Int)],
@@ -801,11 +852,15 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         guard selectedButton != nil else { return }
         let file = selectedJob
         for field in [copies, firstPage, lastPage] { field.isEnabled = !busy && file != nil }
-        rotate.isEnabled = !busy && file != nil
-        for popup in [paperPopup, qualityPopup, mediaPopup, densityPopup, presetPopup] {
+        // Several pages per sheet are always fitted into their cells.
+        let single = (selectedJob?.setup.layout ?? 1) == 1
+        rotate.isEnabled = !busy && file != nil && single
+        orderPopup.isEnabled = !busy && file != nil && !single
+        duplex.isEnabled = !busy && file != nil
+        for popup in [paperPopup, qualityPopup, mediaPopup, densityPopup, presetPopup, layoutPopup] {
             popup.isEnabled = !busy && file != nil
         }
-        fit.isEnabled = !busy && file?.document.isPDF == true
+        fit.isEnabled = !busy && file?.document.isPDF == true && single
         selectedButton.isEnabled = !busy && file != nil
         allButton.isEnabled = !busy && jobs.contains { $0.state == .waiting }
         removeButton.isEnabled = !busy && file != nil

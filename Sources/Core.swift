@@ -104,6 +104,64 @@ enum MediaType: String, CaseIterable, Codable {
     }
 }
 
+/// Reading order of pages on a multi-page sheet (BrPrintLayoutDirection in the Brother ADK).
+enum LayoutOrder: String, CaseIterable, Codable {
+    case rightThenDown, downThenRight, leftThenDown, downThenLeft
+
+    var label: String {
+        switch self {
+        case .rightThenDown: return "从左到右，再向下"
+        case .downThenRight: return "从上到下，再向右"
+        case .leftThenDown: return "从右到左，再向下"
+        case .downThenLeft: return "从上到下，再向左"
+        }
+    }
+}
+
+/// Columns and rows for several pages on one sheet. The grid may turn the sheet sideways:
+/// 2 in 1 on portrait paper prints two portrait pages on a landscape canvas.
+struct SheetGrid: Equatable {
+    let columns: Int
+    let rows: Int
+    let rotated: Bool
+    let canvas: CGSize
+
+    /// Picks the grid that prints pages largest; ties keep the sheet upright.
+    static func best(count: Int, sheet: CGSize, page: CGSize) -> SheetGrid {
+        var best = SheetGrid(columns: 1, rows: count, rotated: false, canvas: sheet)
+        var bestScale: CGFloat = -1
+        for rotated in [false, true] {
+            let canvas = rotated ? CGSize(width: sheet.height, height: sheet.width) : sheet
+            for columns in 1...count where count % columns == 0 {
+                let rows = count / columns
+                let scale = min(canvas.width / CGFloat(columns) / page.width,
+                                canvas.height / CGFloat(rows) / page.height)
+                if scale > bestScale + 0.0001 {
+                    bestScale = scale
+                    best = SheetGrid(columns: columns, rows: rows, rotated: rotated, canvas: canvas)
+                }
+            }
+        }
+        return best
+    }
+
+    /// Cell for the page at `index`, in canvas coordinates with the origin at the bottom left.
+    func cell(_ index: Int, order: LayoutOrder) -> CGRect {
+        let column: Int
+        let row: Int
+        switch order {
+        case .rightThenDown: column = index % columns; row = index / columns
+        case .downThenRight: row = index % rows; column = index / rows
+        case .leftThenDown: column = columns - 1 - index % columns; row = index / columns
+        case .downThenLeft: row = index % rows; column = columns - 1 - index / rows
+        }
+        let width = canvas.width / CGFloat(columns)
+        let height = canvas.height / CGFloat(rows)
+        return CGRect(x: CGFloat(column) * width, y: canvas.height - CGFloat(row + 1) * height,
+                      width: width, height: height)
+    }
+}
+
 /// Paper and output settings for one job. Geometry follows the upstream brlaser margins
 /// (left 8, bottom 8, right 8, top 16 points), which A4 600 dpi output has confirmed.
 struct PageSetup: Equatable, Codable {
@@ -111,7 +169,13 @@ struct PageSetup: Equatable, Codable {
     var quality = PrintQuality.standard
     var media = MediaType.plain
     var density = 0
+    /// Pages per sheet: 1, 2, 4, 9 or 16.
+    var layout = 1
+    var layoutOrder = LayoutOrder.rightThenDown
+    /// Odd sheets first, then the backs after the user turns the stack over.
+    var manualDuplex = false
 
+    static let layouts = [1, 2, 4, 9, 16]
     static let marginLeft: CGFloat = 8
     static let marginBottom: CGFloat = 8
     static let densityRange = -6...6
@@ -122,7 +186,12 @@ struct PageSetup: Equatable, Codable {
     var width: Int { Int((printableSize.width * CGFloat(quality.dpi) / 72).rounded()) }
     var height: Int { Int((printableSize.height * CGFloat(quality.dpi) / 72).rounded()) }
     var rowBytes: Int { (width + 7) / 8 }
-    var summary: String { "\(paper.label) · \(quality.label) · \(media.label)" }
+    var summary: String {
+        var parts = [paper.label, quality.label, media.label]
+        if layout > 1 { parts.append("\(layout) 合 1") }
+        if manualDuplex { parts.append("手动双面") }
+        return parts.joined(separator: " · ")
+    }
 
     var encoderArguments: [String] {
         [paper.rawValue, String(quality.dpi), quality == .tonerSave ? "1" : "0", String(density), media.rawValue]
@@ -138,6 +207,12 @@ struct PageSetup: Equatable, Codable {
         if let value = defaults.string(forKey: "pageMedia"), let media = MediaType(rawValue: value) { setup.media = media }
         let density = defaults.integer(forKey: "pageDensity")
         if densityRange.contains(density) { setup.density = density }
+        let layout = defaults.integer(forKey: "pageLayout")
+        if layouts.contains(layout) { setup.layout = layout }
+        if let value = defaults.string(forKey: "pageLayoutOrder"), let order = LayoutOrder(rawValue: value) {
+            setup.layoutOrder = order
+        }
+        setup.manualDuplex = defaults.bool(forKey: "pageManualDuplex")
         return setup
     }
 
@@ -146,6 +221,31 @@ struct PageSetup: Equatable, Codable {
         defaults.set(quality.rawValue, forKey: "pageQuality")
         defaults.set(media.rawValue, forKey: "pageMedia")
         defaults.set(density, forKey: "pageDensity")
+        defaults.set(layout, forKey: "pageLayout")
+        defaults.set(layoutOrder.rawValue, forKey: "pageLayoutOrder")
+        defaults.set(manualDuplex, forKey: "pageManualDuplex")
+    }
+}
+
+extension PageSetup {
+    private enum CodingKeys: String, CodingKey {
+        case paper, quality, media, density, layout, layoutOrder, manualDuplex
+    }
+
+    /// Fields added later fall back to defaults, so presets saved by older versions still load.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init()
+        paper = try values.decodeIfPresent(PaperSize.self, forKey: .paper) ?? paper
+        quality = try values.decodeIfPresent(PrintQuality.self, forKey: .quality) ?? quality
+        media = try values.decodeIfPresent(MediaType.self, forKey: .media) ?? media
+        density = try values.decodeIfPresent(Int.self, forKey: .density) ?? density
+        layout = try values.decodeIfPresent(Int.self, forKey: .layout) ?? layout
+        layoutOrder = try values.decodeIfPresent(LayoutOrder.self, forKey: .layoutOrder) ?? layoutOrder
+        manualDuplex = try values.decodeIfPresent(Bool.self, forKey: .manualDuplex) ?? manualDuplex
+        guard Self.layouts.contains(layout), Self.densityRange.contains(density) else {
+            throw DecodingError.dataCorruptedError(forKey: .layout, in: values, debugDescription: "out of range")
+        }
     }
 }
 
@@ -155,13 +255,20 @@ struct PrintPreset: Equatable, Codable {
     var setup: PageSetup
 
     static let builtIn: [PrintPreset] = {
+        var twoUp = PageSetup()
+        twoUp.layout = 2
         var draft = PageSetup()
         draft.quality = .draft
         var tonerSave = PageSetup()
         tonerSave.quality = .tonerSave
+        var duplex = PageSetup()
+        duplex.manualDuplex = true
+        // The first three appear on the floating card.
         return [PrintPreset(name: "标准", setup: PageSetup()),
+                PrintPreset(name: "2 合 1", setup: twoUp),
                 PrintPreset(name: "草稿", setup: draft),
-                PrintPreset(name: "省墨", setup: tonerSave)]
+                PrintPreset(name: "省墨", setup: tonerSave),
+                PrintPreset(name: "手动双面", setup: duplex)]
     }()
 
     static func load(_ defaults: UserDefaults = .standard) -> [PrintPreset] {
@@ -234,7 +341,10 @@ struct PrintOptions {
 struct PreparedJob {
     let directory: URL
     let dataURL: URL
+    /// Pages the printer outputs for `dataURL`.
     let sheets: Int
+    /// The second pass of a manual duplex job, sent after the user turns the stack over.
+    var back: (dataURL: URL, sheets: Int)?
     func remove() { try? FileManager.default.removeItem(at: directory) }
 }
 
@@ -279,52 +389,89 @@ enum PrintEngine {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
                                                attributes: [.posixPermissions: 0o700])
         do {
-            let selectedPages = Array(options.firstPage...options.lastPage)
             let setup = options.setup
-            let estimatedBytes = Int64(selectedPages.count) * Int64(setup.rowBytes * setup.height)
+            let selectedPages = Array(options.firstPage...options.lastPage)
+            let perSheet = max(1, setup.layout)
+            let sheets = stride(from: 0, to: selectedPages.count, by: perSheet).map {
+                Array(selectedPages[$0..<min($0 + perSheet, selectedPages.count)])
+            }
+            let estimatedBytes = Int64(sheets.count + 1) * Int64(setup.rowBytes * setup.height)
                 * (1 + 2 * Int64(options.copies))
             let attributes = try FileManager.default.attributesOfFileSystem(forPath: directory.path)
             let free = (attributes[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
             guard free > estimatedBytes + 100_000_000 else {
                 throw PrintFailure(message: "临时磁盘空间不足，请减少页数或份数后重试。")
             }
-            var pages: [URL] = []
-            for (index, page) in selectedPages.enumerated() {
-                progress("正在转换第 \(index + 1)/\(selectedPages.count) 页…")
-                let target = directory.appendingPathComponent("page-\(page).pbm")
-                try raster(document, page: page, rotate: options.rotate, fit: options.fit, setup: setup)
+            var rasters: [URL] = []
+            for (index, pages) in sheets.enumerated() {
+                progress(perSheet == 1 ? "正在转换第 \(index + 1)/\(sheets.count) 页…" :
+                            "正在排版第 \(index + 1)/\(sheets.count) 张…")
+                let target = directory.appendingPathComponent("sheet-\(index + 1).pbm")
+                try raster(document, pages: pages, rotate: options.rotate, fit: options.fit, setup: setup)
                     .write(to: target)
-                pages.append(target)
+                rasters.append(target)
             }
             progress("正在生成打印数据…")
             let dataURL = directory.appendingPathComponent("job.prn")
-            let process = Process()
-            process.executableURL = encoder
-            process.arguments = [dataURL.path, String(options.copies)] + setup.encoderArguments + pages.map(\.path)
-            let errors = Pipe()
-            process.standardError = errors
-            try process.run()
-            let errorData = errors.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
-                throw PrintFailure(message: "编码失败：\(String(decoding: errorData, as: UTF8.self))")
+            // A single sheet has no back, so it prints as usual.
+            guard setup.manualDuplex, rasters.count > 1 else {
+                try encode(encoder, output: dataURL, copies: options.copies, setup: setup, pages: rasters)
+                return PreparedJob(directory: directory, dataURL: dataURL, sheets: rasters.count * options.copies)
             }
-            guard let size = try dataURL.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 128 else {
-                throw PrintFailure(message: "打印数据为空，未发送任何任务。")
+            // Each copy gets an even sheet count, so its last front still comes out with a blank back.
+            let blank = directory.appendingPathComponent("blank.pbm")
+            try pack([UInt8](repeating: 255, count: setup.width * setup.height),
+                     width: setup.width, height: setup.height).write(to: blank)
+            var sequence: [URL] = []
+            for _ in 0..<options.copies {
+                sequence += rasters
+                if rasters.count % 2 == 1 { sequence.append(blank) }
             }
-            return PreparedJob(directory: directory, dataURL: dataURL,
-                               sheets: selectedPages.count * options.copies)
+            let fronts = stride(from: 0, to: sequence.count, by: 2).map { sequence[$0] }
+            let backs = stride(from: 1, to: sequence.count, by: 2).map { sequence[$0] }
+            let backURL = directory.appendingPathComponent("back.prn")
+            try encode(encoder, output: dataURL, copies: 1, setup: setup, pages: fronts)
+            try encode(encoder, output: backURL, copies: 1, setup: setup, pages: backs)
+            return PreparedJob(directory: directory, dataURL: dataURL, sheets: fronts.count,
+                               back: (backURL, backs.count))
         } catch {
             try? FileManager.default.removeItem(at: directory)
             throw error
         }
     }
 
+    static func encode(_ encoder: URL, output: URL, copies: Int, setup: PageSetup, pages: [URL]) throws {
+        let process = Process()
+        process.executableURL = encoder
+        process.arguments = [output.path, String(copies)] + setup.encoderArguments + pages.map(\.path)
+        let errors = Pipe()
+        process.standardError = errors
+        try process.run()
+        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw PrintFailure(message: "编码失败：\(String(decoding: errorData, as: UTF8.self))")
+        }
+        guard let size = try output.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 128 else {
+            throw PrintFailure(message: "打印数据为空，未发送任何任务。")
+        }
+    }
+
     static func raster(_ document: PrintDocument, page number: Int,
                        rotate: Bool, fit: Bool, setup: PageSetup = PageSetup()) throws -> Data {
-        guard (1...document.pageCount).contains(number) else {
+        try raster(document, pages: [number], rotate: rotate, fit: fit, setup: setup)
+    }
+
+    /// Renders one sheet. With more than one page per sheet the pages are always fitted into
+    /// their grid cells, and the rotate and actual-size options do not apply.
+    static func raster(_ document: PrintDocument, pages numbers: [Int],
+                       rotate: Bool, fit: Bool, setup: PageSetup = PageSetup()) throws -> Data {
+        guard !numbers.isEmpty, numbers.count <= max(1, setup.layout),
+              numbers.allSatisfy({ (1...document.pageCount).contains($0) }) else {
             throw PrintFailure(message: "文档页码无效。")
         }
+        if setup.layout > 1 { return try sheet(document, pages: numbers, setup: setup) }
+        let number = numbers[0]
         let width = setup.width
         let height = setup.height
         let printableWidth = setup.printableSize.width
@@ -380,6 +527,76 @@ enum PrintEngine {
                 if rotate { context.rotate(by: .pi / 2) }
                 context.draw(image, in: CGRect(x: -CGFloat(image.width) / 2, y: -CGFloat(image.height) / 2,
                                               width: CGFloat(image.width), height: CGFloat(image.height)))
+            }
+        }
+        return pack(gray, width: width, height: height)
+    }
+
+    private static func sheet(_ document: PrintDocument, pages numbers: [Int], setup: PageSetup) throws -> Data {
+        let width = setup.width
+        let height = setup.height
+        let printable = setup.printableSize
+        let pdf = document.isPDF ? CGPDFDocument(document.url as CFURL) : nil
+        var image: CGImage?
+        if !document.isPDF {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: max(width, height)
+            ]
+            if let source = CGImageSourceCreateWithURL(document.url as CFURL, nil) {
+                image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+            }
+        }
+        func pageSize(_ number: Int) throws -> CGSize {
+            if let image = image { return CGSize(width: image.width, height: image.height) }
+            guard let page = pdf?.page(at: number) else { throw PrintFailure(message: "无法读取 PDF 页面。") }
+            let box = page.getBoxRect(.cropBox)
+            guard box.width.isFinite, box.height.isFinite, box.width > 0, box.height > 0 else {
+                throw PrintFailure(message: "PDF 页面尺寸无效。")
+            }
+            return page.rotationAngle % 180 == 0 ? box.size : CGSize(width: box.height, height: box.width)
+        }
+        let grid = SheetGrid.best(count: setup.layout, sheet: printable, page: try pageSize(numbers[0]))
+        var gray = [UInt8](repeating: 255, count: width * height)
+        try gray.withUnsafeMutableBytes { memory in
+            guard let context = CGContext(data: memory.baseAddress, width: width, height: height,
+                                          bitsPerComponent: 8, bytesPerRow: width,
+                                          space: CGColorSpaceCreateDeviceGray(),
+                                          bitmapInfo: CGImageAlphaInfo.none.rawValue) else {
+                throw PrintFailure(message: "无法创建页面位图。")
+            }
+            context.setFillColor(gray: 1, alpha: 1)
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            context.scaleBy(x: CGFloat(width) / printable.width, y: CGFloat(height) / printable.height)
+            context.interpolationQuality = .high
+            if grid.rotated {
+                // The canvas's top edge runs along the sheet's left edge.
+                context.translateBy(x: printable.width, y: 0)
+                context.rotate(by: .pi / 2)
+            }
+            for (index, number) in numbers.enumerated() {
+                let cell = grid.cell(index, order: setup.layoutOrder).insetBy(dx: 4, dy: 4)
+                context.saveGState()
+                context.clip(to: cell)
+                if let image = image {
+                    let scale = min(cell.width / CGFloat(image.width), cell.height / CGFloat(image.height))
+                    let size = CGSize(width: CGFloat(image.width) * scale, height: CGFloat(image.height) * scale)
+                    context.draw(image, in: CGRect(x: cell.midX - size.width / 2, y: cell.midY - size.height / 2,
+                                                  width: size.width, height: size.height))
+                } else if let page = pdf?.page(at: number) {
+                    let size = try pageSize(number)
+                    let scale = min(cell.width / size.width, cell.height / size.height)
+                    // Scale explicitly: the PDF drawing transform never enlarges a page.
+                    context.translateBy(x: cell.midX, y: cell.midY)
+                    context.scaleBy(x: scale, y: scale)
+                    context.rotate(by: -CGFloat(page.rotationAngle) * .pi / 180)
+                    let box = page.getBoxRect(.cropBox)
+                    context.translateBy(x: -box.midX, y: -box.midY)
+                    context.clip(to: box)
+                    context.drawPDFPage(page)
+                }
+                context.restoreGState()
             }
         }
         return pack(gray, width: width, height: height)

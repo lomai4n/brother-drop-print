@@ -9,6 +9,8 @@ enum FlashStage: Equatable { case hidden, pill, card, result }
 
 private final class FlashWindow: NSPanel {
     var allowsKey = false
+    var onCancel: (() -> Void)?
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
     override var canBecomeKey: Bool { allowsKey }
     override var canBecomeMain: Bool { false }
 }
@@ -58,6 +60,8 @@ final class FlashDropController: NSObject {
     var onClear: (([QueuedPrintFile]) -> Void)?
     var onSettings: (() -> Void)?
     var presets: () -> [PrintPreset] = { PrintPreset.load() }
+    /// Set by the app while a window it opened for the panel (such as a file chooser) is up.
+    var holdOpen = false
     private(set) var stage = FlashStage.hidden
     private(set) var files: [QueuedPrintFile] = []
 
@@ -81,9 +85,13 @@ final class FlashDropController: NSObject {
     private let paperPopup = NSPopUpButton()
     private let qualityPopup = NSPopUpButton()
     private let presetPopup = NSPopUpButton()
+    private let layoutPopup = NSPopUpButton()
+    private let duplexBox = NSButton(checkboxWithTitle: "手动双面", target: nil, action: nil)
     private let chipRow = NSStackView()
     /// Set when the drop landed on a preset chip, for files that arrive from this drag.
     private var pendingPreset: PrintPreset?
+    private var clickMonitors: [Any] = []
+    private var gestureHadFileDrag = false
     private let printer = NSTextField(labelWithString: "")
     private let status = NSTextField(wrappingLabelWithString: "")
     private var printButton: NSButton!
@@ -131,6 +139,7 @@ final class FlashDropController: NSObject {
         buildPill()
         buildCard()
         buildResult()
+        panel.onCancel = { [weak self] in self?.hide() }
         dropView.onHover = { [weak self] active in self?.hover(active) }
         dropView.onRejected = { [weak self] reason in self?.reject(reason) }
     }
@@ -138,6 +147,8 @@ final class FlashDropController: NSObject {
     // MARK: Drag lifecycle
 
     func beginDrag() {
+        // A file drag that starts while the print panel is open may be adding files to it.
+        if stage == .result { gestureHadFileDrag = true }
         hiding?.cancel()
         hiding = nil
         pendingPreset = nil
@@ -193,6 +204,7 @@ final class FlashDropController: NSObject {
         let wasVisible = panel.isVisible
         panel.orderOut(nil)
         panel.allowsKey = false
+        stopWatchingClicks()
         stage = .hidden
         files.removeAll()
         pendingPreset = nil
@@ -257,6 +269,8 @@ final class FlashDropController: NSObject {
         let setup = files.first?.setup ?? .saved()
         paperPopup.selectItem(at: PaperSize.allCases.firstIndex(of: setup.paper) ?? 0)
         qualityPopup.selectItem(at: PrintQuality.allCases.firstIndex(of: setup.quality) ?? 0)
+        layoutPopup.selectItem(at: PageSetup.layouts.firstIndex(of: setup.layout) ?? 0)
+        duplexBox.state = setup.manualDuplex ? .on : .off
         let list = presets()
         presetPopup.removeAllItems()
         presetPopup.addItems(withTitles: list.map(\.name))
@@ -276,7 +290,8 @@ final class FlashDropController: NSObject {
         printButton.title = sent ? "再次打印" : "打印"
         printButton.isEnabled = !busy && !files.isEmpty
         trash.isEnabled = !busy && !files.isEmpty
-        for control in [copies, firstPage, lastPage, stepper, paperPopup, qualityPopup, presetPopup] as [NSControl] {
+        for control in [copies, firstPage, lastPage, stepper, paperPopup, qualityPopup, presetPopup,
+                        layoutPopup, duplexBox] as [NSControl] {
             control.isEnabled = !busy
         }
         fitResult()
@@ -306,6 +321,7 @@ final class FlashDropController: NSObject {
         card.isHidden = next != .card
         result.isHidden = next != .result
         panel.allowsKey = next == .result
+        if next == .result { watchOutsideClicks() } else { stopWatchingClicks() }
         if next == .pill { startCarousel() } else { carousel?.invalidate(); carousel = nil }
         if next == .card {
             zone.rejected = false
@@ -336,6 +352,37 @@ final class FlashDropController: NSObject {
                     panel.animator().setFrame(target, display: true)
                 }
             }
+        }
+    }
+
+    /// Like a popover: a click elsewhere closes the print panel. The files stay in the workbench list.
+    private func watchOutsideClicks() {
+        guard clickMonitors.isEmpty else { return }
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .leftMouseUp, .rightMouseDown]
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            self?.outsideClick(event)
+        }) { clickMonitors.append(global) }
+        if let local = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            // Only this app's ordinary windows count; menus and pop-up lists from the panel do not.
+            if let self = self, let window = event.window, window !== self.panel, window.level == .normal {
+                self.outsideClick(event)
+            }
+            return event
+        }) { clickMonitors.append(local) }
+    }
+
+    private func stopWatchingClicks() {
+        clickMonitors.forEach(NSEvent.removeMonitor)
+        clickMonitors.removeAll()
+    }
+
+    private func outsideClick(_ event: NSEvent) {
+        guard stage == .result, !holdOpen else { return }
+        switch event.type {
+        case .leftMouseDown: gestureHadFileDrag = false
+        // Decide on release, so a file dragged from elsewhere can still be added to the panel.
+        case .leftMouseUp: if !gestureHadFileDrag { hide() }
+        default: hide()
         }
     }
 
@@ -470,9 +517,9 @@ final class FlashDropController: NSObject {
         label.font = .systemFont(ofSize: 13, weight: .semibold)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let close = iconButton("xmark", label: "关闭") { [weak self] in self?.hide() }
-        let row = NSStackView(views: [symbol("printer.fill", size: 13), label, spacer, close])
+        let row = NSStackView(views: [symbol("printer.fill", size: 13), label, spacer])
         row.spacing = 7
+        row.heightAnchor.constraint(equalToConstant: 22).isActive = true
         return row
     }
 
@@ -535,7 +582,7 @@ final class FlashDropController: NSObject {
         zone.widthAnchor.constraint(equalTo: card.widthAnchor, constant: -28).isActive = true
         zone.setContentHuggingPriority(.defaultLow, for: .vertical)
         zone.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        let chipTitle = NSTextField(labelWithString: "或拖到预设上，直接带上纸张和质量")
+        let chipTitle = NSTextField(labelWithString: "或拖到预设上，直接带上该预设的设置")
         chipTitle.font = .systemFont(ofSize: 11)
         chipTitle.textColor = .secondaryLabelColor
         card.addArrangedSubview(chipTitle)
@@ -564,7 +611,9 @@ final class FlashDropController: NSObject {
         NSLayoutConstraint.activate([
             result.leadingAnchor.constraint(equalTo: dropView.leadingAnchor, constant: 14),
             result.trailingAnchor.constraint(equalTo: dropView.trailingAnchor, constant: -14),
-            result.topAnchor.constraint(equalTo: dropView.topAnchor, constant: 12)
+            result.topAnchor.constraint(equalTo: dropView.topAnchor, constant: 12),
+            // Fixed width: long names truncate instead of widening the panel past its buttons.
+            result.widthAnchor.constraint(equalToConstant: width - 28)
         ])
         func full(_ view: NSView) {
             result.addArrangedSubview(view)
@@ -608,6 +657,9 @@ final class FlashDropController: NSObject {
 
         name.font = .systemFont(ofSize: 13, weight: .semibold)
         name.lineBreakMode = .byTruncatingMiddle
+        for label in [name, detail, printer, status] {
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        }
         name.alignment = .center
         full(name)
         detail.font = .systemFont(ofSize: 11)
@@ -658,13 +710,17 @@ final class FlashDropController: NSObject {
         qualityPopup.setAccessibilityLabel("打印质量")
         presetPopup.autoenablesItems = false
         presetPopup.setAccessibilityLabel("打印预设")
-        for popup in [presetPopup, paperPopup, qualityPopup] {
-            popup.target = self
-            popup.action = #selector(setupChosen(_:))
+        layoutPopup.addItems(withTitles: PageSetup.layouts.map { "\($0) 合 1" })
+        layoutPopup.setAccessibilityLabel("每张纸的页数")
+        duplexBox.setAccessibilityHelp("先印正面，翻面放回纸盒后再印背面")
+        for control in [presetPopup, paperPopup, qualityPopup, layoutPopup, duplexBox] as [NSControl] {
+            control.target = self
+            control.action = #selector(setupChosen(_:))
         }
         full(NSStackView(views: [label("预设"), presetPopup, spacer()]))
         full(NSStackView(views: [label("纸张"), paperPopup, spacer()]))
         full(NSStackView(views: [label("质量"), qualityPopup, spacer()]))
+        full(NSStackView(views: [label("版式"), layoutPopup, duplexBox, spacer()]))
         printer.font = .systemFont(ofSize: 12)
         printer.lineBreakMode = .byTruncatingTail
         full(NSStackView(views: [label("打印机"), printer, spacer()]))
@@ -685,16 +741,18 @@ final class FlashDropController: NSObject {
 
     @objc private func stepped() { copies.stringValue = String(stepper.integerValue) }
 
-    @objc private func setupChosen(_ sender: NSPopUpButton) {
+    @objc private func setupChosen(_ sender: NSControl) {
         guard !files.isEmpty else { return }
         var setup = files[0].setup
         if sender === presetPopup {
             let list = presets()
-            guard list.indices.contains(sender.indexOfSelectedItem) else { return }
-            setup = list[sender.indexOfSelectedItem].setup
+            guard list.indices.contains(presetPopup.indexOfSelectedItem) else { return }
+            setup = list[presetPopup.indexOfSelectedItem].setup
         } else {
             setup.paper = PaperSize.allCases[max(paperPopup.indexOfSelectedItem, 0)]
             setup.quality = PrintQuality.allCases[max(qualityPopup.indexOfSelectedItem, 0)]
+            setup.layout = PageSetup.layouts[max(layoutPopup.indexOfSelectedItem, 0)]
+            setup.manualDuplex = duplexBox.state == .on
         }
         for file in files { file.setup = setup }
         setup.save()
