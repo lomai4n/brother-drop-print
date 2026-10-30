@@ -46,6 +46,259 @@ struct PrintDocument {
     }
 }
 
+enum PaperSize: String, CaseIterable, Codable {
+    case a4 = "A4", a5 = "A5", a6 = "A6", b5 = "B5"
+    case letter = "LETTER", legal = "LEGAL", executive = "EXECUTIVE"
+
+    var label: String {
+        switch self {
+        case .a4: return "A4"
+        case .a5: return "A5"
+        case .a6: return "A6"
+        case .b5: return "B5"
+        case .letter: return "Letter"
+        case .legal: return "Legal"
+        case .executive: return "Executive"
+        }
+    }
+
+    /// Size in points; must match the table in native/Encoder.cpp.
+    var points: CGSize {
+        switch self {
+        case .a4: return CGSize(width: 595, height: 842)
+        case .a5: return CGSize(width: 420, height: 595)
+        case .a6: return CGSize(width: 297, height: 420)
+        case .b5: return CGSize(width: 499, height: 709)
+        case .letter: return CGSize(width: 612, height: 792)
+        case .legal: return CGSize(width: 612, height: 1008)
+        case .executive: return CGSize(width: 522, height: 756)
+        }
+    }
+}
+
+enum PrintQuality: String, CaseIterable, Codable {
+    case standard, draft, tonerSave
+
+    var label: String {
+        switch self {
+        case .standard: return "标准 600 dpi"
+        case .draft: return "草稿 300 dpi"
+        case .tonerSave: return "省墨 600 dpi"
+        }
+    }
+    var dpi: Int { self == .draft ? 300 : 600 }
+}
+
+enum MediaType: String, CaseIterable, Codable {
+    case plain = "PLAIN", thin = "THIN", thick = "THICK", thicker = "THICKER", bond = "BOND", envelope = "ENV"
+
+    var label: String {
+        switch self {
+        case .plain: return "普通纸"
+        case .thin: return "薄纸"
+        case .thick: return "厚纸"
+        case .thicker: return "较厚纸"
+        case .bond: return "证券纸"
+        case .envelope: return "信封"
+        }
+    }
+}
+
+/// Reading order of pages on a multi-page sheet (BrPrintLayoutDirection in the Brother ADK).
+enum LayoutOrder: String, CaseIterable, Codable {
+    case rightThenDown, downThenRight, leftThenDown, downThenLeft
+
+    var label: String {
+        switch self {
+        case .rightThenDown: return "从左到右，再向下"
+        case .downThenRight: return "从上到下，再向右"
+        case .leftThenDown: return "从右到左，再向下"
+        case .downThenLeft: return "从上到下，再向左"
+        }
+    }
+}
+
+/// Columns and rows for several pages on one sheet. The grid may turn the sheet sideways:
+/// 2 in 1 on portrait paper prints two portrait pages on a landscape canvas.
+struct SheetGrid: Equatable {
+    let columns: Int
+    let rows: Int
+    let rotated: Bool
+    let canvas: CGSize
+
+    /// Picks the grid that prints pages largest; ties keep the sheet upright.
+    static func best(count: Int, sheet: CGSize, page: CGSize) -> SheetGrid {
+        var best = SheetGrid(columns: 1, rows: count, rotated: false, canvas: sheet)
+        var bestScale: CGFloat = -1
+        for rotated in [false, true] {
+            let canvas = rotated ? CGSize(width: sheet.height, height: sheet.width) : sheet
+            for columns in 1...count where count % columns == 0 {
+                let rows = count / columns
+                let scale = min(canvas.width / CGFloat(columns) / page.width,
+                                canvas.height / CGFloat(rows) / page.height)
+                if scale > bestScale + 0.0001 {
+                    bestScale = scale
+                    best = SheetGrid(columns: columns, rows: rows, rotated: rotated, canvas: canvas)
+                }
+            }
+        }
+        return best
+    }
+
+    /// Cell for the page at `index`, in canvas coordinates with the origin at the bottom left.
+    func cell(_ index: Int, order: LayoutOrder) -> CGRect {
+        let column: Int
+        let row: Int
+        switch order {
+        case .rightThenDown: column = index % columns; row = index / columns
+        case .downThenRight: row = index % rows; column = index / rows
+        case .leftThenDown: column = columns - 1 - index % columns; row = index / columns
+        case .downThenLeft: row = index % rows; column = columns - 1 - index / rows
+        }
+        let width = canvas.width / CGFloat(columns)
+        let height = canvas.height / CGFloat(rows)
+        return CGRect(x: CGFloat(column) * width, y: canvas.height - CGFloat(row + 1) * height,
+                      width: width, height: height)
+    }
+}
+
+/// Paper and output settings for one job. Geometry follows the upstream brlaser margins
+/// (left 8, bottom 8, right 8, top 16 points), which A4 600 dpi output has confirmed.
+struct PageSetup: Equatable, Codable {
+    var paper = PaperSize.a4
+    var quality = PrintQuality.standard
+    var media = MediaType.plain
+    var density = 0
+    /// Pages per sheet: 1, 2, 4, 9 or 16.
+    var layout = 1
+    var layoutOrder = LayoutOrder.rightThenDown
+    /// Odd sheets first, then the backs after the user turns the stack over.
+    var manualDuplex = false
+
+    static let layouts = [1, 2, 4, 9, 16]
+    static let marginLeft: CGFloat = 8
+    static let marginBottom: CGFloat = 8
+    static let densityRange = -6...6
+
+    var printableSize: CGSize {
+        CGSize(width: paper.points.width - 16, height: paper.points.height - 24)
+    }
+    var width: Int { Int((printableSize.width * CGFloat(quality.dpi) / 72).rounded()) }
+    var height: Int { Int((printableSize.height * CGFloat(quality.dpi) / 72).rounded()) }
+    var rowBytes: Int { (width + 7) / 8 }
+    var summary: String {
+        var parts = [paper.label, quality.label, media.label]
+        if layout > 1 { parts.append("\(layout) 合 1") }
+        if manualDuplex { parts.append("手动双面") }
+        return parts.joined(separator: " · ")
+    }
+
+    var encoderArguments: [String] {
+        [paper.rawValue, String(quality.dpi), quality == .tonerSave ? "1" : "0", String(density), media.rawValue]
+    }
+
+    /// The last setup used, so new files start from it.
+    static func saved(_ defaults: UserDefaults = .standard) -> PageSetup {
+        var setup = PageSetup()
+        if let value = defaults.string(forKey: "pagePaper"), let paper = PaperSize(rawValue: value) { setup.paper = paper }
+        if let value = defaults.string(forKey: "pageQuality"), let quality = PrintQuality(rawValue: value) {
+            setup.quality = quality
+        }
+        if let value = defaults.string(forKey: "pageMedia"), let media = MediaType(rawValue: value) { setup.media = media }
+        let density = defaults.integer(forKey: "pageDensity")
+        if densityRange.contains(density) { setup.density = density }
+        let layout = defaults.integer(forKey: "pageLayout")
+        if layouts.contains(layout) { setup.layout = layout }
+        if let value = defaults.string(forKey: "pageLayoutOrder"), let order = LayoutOrder(rawValue: value) {
+            setup.layoutOrder = order
+        }
+        setup.manualDuplex = defaults.bool(forKey: "pageManualDuplex")
+        return setup
+    }
+
+    func save(_ defaults: UserDefaults = .standard) {
+        defaults.set(paper.rawValue, forKey: "pagePaper")
+        defaults.set(quality.rawValue, forKey: "pageQuality")
+        defaults.set(media.rawValue, forKey: "pageMedia")
+        defaults.set(density, forKey: "pageDensity")
+        defaults.set(layout, forKey: "pageLayout")
+        defaults.set(layoutOrder.rawValue, forKey: "pageLayoutOrder")
+        defaults.set(manualDuplex, forKey: "pageManualDuplex")
+    }
+}
+
+extension PageSetup {
+    private enum CodingKeys: String, CodingKey {
+        case paper, quality, media, density, layout, layoutOrder, manualDuplex
+    }
+
+    /// Fields added later fall back to defaults, so presets saved by older versions still load.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init()
+        paper = try values.decodeIfPresent(PaperSize.self, forKey: .paper) ?? paper
+        quality = try values.decodeIfPresent(PrintQuality.self, forKey: .quality) ?? quality
+        media = try values.decodeIfPresent(MediaType.self, forKey: .media) ?? media
+        density = try values.decodeIfPresent(Int.self, forKey: .density) ?? density
+        layout = try values.decodeIfPresent(Int.self, forKey: .layout) ?? layout
+        layoutOrder = try values.decodeIfPresent(LayoutOrder.self, forKey: .layoutOrder) ?? layoutOrder
+        manualDuplex = try values.decodeIfPresent(Bool.self, forKey: .manualDuplex) ?? manualDuplex
+        guard Self.layouts.contains(layout), Self.densityRange.contains(density) else {
+            throw DecodingError.dataCorruptedError(forKey: .layout, in: values, debugDescription: "out of range")
+        }
+    }
+}
+
+/// A named page setup, offered as a drop target on the floating card and as a quick choice.
+struct PrintPreset: Equatable, Codable {
+    var name: String
+    var setup: PageSetup
+
+    static let builtIn: [PrintPreset] = {
+        var twoUp = PageSetup()
+        twoUp.layout = 2
+        var draft = PageSetup()
+        draft.quality = .draft
+        var tonerSave = PageSetup()
+        tonerSave.quality = .tonerSave
+        var duplex = PageSetup()
+        duplex.manualDuplex = true
+        // The first three appear on the floating card.
+        return [PrintPreset(name: "标准", setup: PageSetup()),
+                PrintPreset(name: "2 合 1", setup: twoUp),
+                PrintPreset(name: "草稿", setup: draft),
+                PrintPreset(name: "省墨", setup: tonerSave),
+                PrintPreset(name: "手动双面", setup: duplex)]
+    }()
+
+    static func load(_ defaults: UserDefaults = .standard) -> [PrintPreset] {
+        guard let data = defaults.data(forKey: "printPresets"),
+              let presets = try? JSONDecoder().decode([PrintPreset].self, from: data),
+              !presets.isEmpty else { return builtIn }
+        return presets
+    }
+
+    static func store(_ presets: [PrintPreset], _ defaults: UserDefaults = .standard) {
+        guard !presets.isEmpty, let data = try? JSONEncoder().encode(presets) else { return }
+        defaults.set(data, forKey: "printPresets")
+    }
+
+    /// Adds or replaces by name; names are trimmed and must not be empty.
+    static func saving(_ preset: PrintPreset, into presets: [PrintPreset]) throws -> [PrintPreset] {
+        let name = preset.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name.count <= 12 else { throw PrintFailure(message: "预设名称需为 1–12 个字。") }
+        var result = presets
+        let named = PrintPreset(name: name, setup: preset.setup)
+        if let index = result.firstIndex(where: { $0.name == name }) { result[index] = named }
+        else { result.append(named) }
+        return result
+    }
+
+    static func matching(_ setup: PageSetup, in presets: [PrintPreset]) -> PrintPreset? {
+        presets.first { $0.setup == setup }
+    }
+}
+
 struct PrintOptions {
     let host: String
     let port: Int
@@ -55,8 +308,9 @@ struct PrintOptions {
     let rotate: Bool
     let fit: Bool
     var interface: String = ""
+    var setup = PageSetup()
 
-    func validate(pageCount: Int) throws {
+    static func validateAddress(host: String, port: Int) throws {
         var address = in_addr()
         guard host.withCString({ inet_pton(AF_INET, $0, &address) }) == 1 else {
             throw PrintFailure(message: "请输入打印机或转发路由器的 IPv4 地址。")
@@ -64,12 +318,20 @@ struct PrintOptions {
         guard (1...65535).contains(port) else {
             throw PrintFailure(message: "端口必须在 1–65535 之间。")
         }
+    }
+
+    static func validatePages(copies: Int, firstPage: Int, lastPage: Int, pageCount: Int) throws {
         guard (1...99).contains(copies) else {
             throw PrintFailure(message: "份数必须在 1–99 之间。")
         }
         guard firstPage >= 1, lastPage >= firstPage, lastPage <= pageCount else {
             throw PrintFailure(message: "页码范围超出了文档页数。")
         }
+    }
+
+    func validate(pageCount: Int) throws {
+        try Self.validateAddress(host: host, port: port)
+        try Self.validatePages(copies: copies, firstPage: firstPage, lastPage: lastPage, pageCount: pageCount)
         guard interface.isEmpty || if_nametoindex(interface) != 0 else {
             throw PrintFailure(message: "选定的网卡不可用，请检查有线连接或重新选择网卡。")
         }
@@ -79,19 +341,17 @@ struct PrintOptions {
 struct PreparedJob {
     let directory: URL
     let dataURL: URL
+    /// Pages the printer outputs for `dataURL`.
     let sheets: Int
+    /// The second pass of a manual duplex job, sent after the user turns the stack over.
+    var back: (dataURL: URL, sheets: Int)?
     func remove() { try? FileManager.default.removeItem(at: directory) }
 }
 
 enum PrintEngine {
-    // shortcut: A4/600 dpi follows the upstream DCP-1600/1610 profile; add other media after hardware calibration.
-    static let width = 4825
-    static let height = 6817
-    static let rowBytes = 604
+    // The calibration page stays A4.
     static let paperWidth: CGFloat = 595
     static let paperHeight: CGFloat = 842
-    static let printableWidth: CGFloat = 579
-    static let printableHeight: CGFloat = 818
 
     static func networkAdapters() -> [NetworkAdapter] {
         var addresses: UnsafeMutablePointer<ifaddrs>?
@@ -129,50 +389,93 @@ enum PrintEngine {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
                                                attributes: [.posixPermissions: 0o700])
         do {
+            let setup = options.setup
             let selectedPages = Array(options.firstPage...options.lastPage)
-            let estimatedBytes = Int64(selectedPages.count) * Int64(rowBytes * height)
+            let perSheet = max(1, setup.layout)
+            let sheets = stride(from: 0, to: selectedPages.count, by: perSheet).map {
+                Array(selectedPages[$0..<min($0 + perSheet, selectedPages.count)])
+            }
+            let estimatedBytes = Int64(sheets.count + 1) * Int64(setup.rowBytes * setup.height)
                 * (1 + 2 * Int64(options.copies))
             let attributes = try FileManager.default.attributesOfFileSystem(forPath: directory.path)
             let free = (attributes[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
             guard free > estimatedBytes + 100_000_000 else {
                 throw PrintFailure(message: "临时磁盘空间不足，请减少页数或份数后重试。")
             }
-            var pages: [URL] = []
-            for (index, page) in selectedPages.enumerated() {
-                progress("正在转换第 \(index + 1)/\(selectedPages.count) 页…")
-                let target = directory.appendingPathComponent("page-\(page).pbm")
-                try raster(document, page: page, rotate: options.rotate, fit: options.fit).write(to: target)
-                pages.append(target)
+            var rasters: [URL] = []
+            for (index, pages) in sheets.enumerated() {
+                progress(perSheet == 1 ? "正在转换第 \(index + 1)/\(sheets.count) 页…" :
+                            "正在排版第 \(index + 1)/\(sheets.count) 张…")
+                let target = directory.appendingPathComponent("sheet-\(index + 1).pbm")
+                try raster(document, pages: pages, rotate: options.rotate, fit: options.fit, setup: setup)
+                    .write(to: target)
+                rasters.append(target)
             }
             progress("正在生成打印数据…")
             let dataURL = directory.appendingPathComponent("job.prn")
-            let process = Process()
-            process.executableURL = encoder
-            process.arguments = [dataURL.path, String(options.copies)] + pages.map(\.path)
-            let errors = Pipe()
-            process.standardError = errors
-            try process.run()
-            let errorData = errors.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
-                throw PrintFailure(message: "编码失败：\(String(decoding: errorData, as: UTF8.self))")
+            // A single sheet has no back, so it prints as usual.
+            guard setup.manualDuplex, rasters.count > 1 else {
+                try encode(encoder, output: dataURL, copies: options.copies, setup: setup, pages: rasters)
+                return PreparedJob(directory: directory, dataURL: dataURL, sheets: rasters.count * options.copies)
             }
-            guard let size = try dataURL.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 128 else {
-                throw PrintFailure(message: "打印数据为空，未发送任何任务。")
+            // Each copy gets an even sheet count, so its last front still comes out with a blank back.
+            let blank = directory.appendingPathComponent("blank.pbm")
+            try pack([UInt8](repeating: 255, count: setup.width * setup.height),
+                     width: setup.width, height: setup.height).write(to: blank)
+            var sequence: [URL] = []
+            for _ in 0..<options.copies {
+                sequence += rasters
+                if rasters.count % 2 == 1 { sequence.append(blank) }
             }
-            return PreparedJob(directory: directory, dataURL: dataURL,
-                               sheets: selectedPages.count * options.copies)
+            let fronts = stride(from: 0, to: sequence.count, by: 2).map { sequence[$0] }
+            let backs = stride(from: 1, to: sequence.count, by: 2).map { sequence[$0] }
+            let backURL = directory.appendingPathComponent("back.prn")
+            try encode(encoder, output: dataURL, copies: 1, setup: setup, pages: fronts)
+            try encode(encoder, output: backURL, copies: 1, setup: setup, pages: backs)
+            return PreparedJob(directory: directory, dataURL: dataURL, sheets: fronts.count,
+                               back: (backURL, backs.count))
         } catch {
             try? FileManager.default.removeItem(at: directory)
             throw error
         }
     }
 
+    static func encode(_ encoder: URL, output: URL, copies: Int, setup: PageSetup, pages: [URL]) throws {
+        let process = Process()
+        process.executableURL = encoder
+        process.arguments = [output.path, String(copies)] + setup.encoderArguments + pages.map(\.path)
+        let errors = Pipe()
+        process.standardError = errors
+        try process.run()
+        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw PrintFailure(message: "编码失败：\(String(decoding: errorData, as: UTF8.self))")
+        }
+        guard let size = try output.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 128 else {
+            throw PrintFailure(message: "打印数据为空，未发送任何任务。")
+        }
+    }
+
     static func raster(_ document: PrintDocument, page number: Int,
-                       rotate: Bool, fit: Bool) throws -> Data {
-        guard (1...document.pageCount).contains(number) else {
+                       rotate: Bool, fit: Bool, setup: PageSetup = PageSetup()) throws -> Data {
+        try raster(document, pages: [number], rotate: rotate, fit: fit, setup: setup)
+    }
+
+    /// Renders one sheet. With more than one page per sheet the pages are always fitted into
+    /// their grid cells, and the rotate and actual-size options do not apply.
+    static func raster(_ document: PrintDocument, pages numbers: [Int],
+                       rotate: Bool, fit: Bool, setup: PageSetup = PageSetup()) throws -> Data {
+        guard !numbers.isEmpty, numbers.count <= max(1, setup.layout),
+              numbers.allSatisfy({ (1...document.pageCount).contains($0) }) else {
             throw PrintFailure(message: "文档页码无效。")
         }
+        if setup.layout > 1 { return try sheet(document, pages: numbers, setup: setup) }
+        let number = numbers[0]
+        let width = setup.width
+        let height = setup.height
+        let printableWidth = setup.printableSize.width
+        let printableHeight = setup.printableSize.height
         var gray = [UInt8](repeating: 255, count: width * height)
         try gray.withUnsafeMutableBytes { memory in
             guard let context = CGContext(data: memory.baseAddress, width: width, height: height,
@@ -200,7 +503,8 @@ enum PrintEngine {
                         rect: CGRect(x: 0, y: 0, width: printableWidth, height: printableHeight),
                         rotate: rotate ? 90 : 0, preserveAspectRatio: true))
                 } else {
-                    context.translateBy(x: paperWidth / 2 - 8, y: paperHeight / 2 - 8)
+                    context.translateBy(x: setup.paper.points.width / 2 - PageSetup.marginLeft,
+                                        y: setup.paper.points.height / 2 - PageSetup.marginBottom)
                     context.rotate(by: CGFloat(page.rotationAngle + (rotate ? 90 : 0)) * .pi / 180)
                     context.translateBy(x: -box.midX, y: -box.midY)
                 }
@@ -225,11 +529,82 @@ enum PrintEngine {
                                               width: CGFloat(image.width), height: CGFloat(image.height)))
             }
         }
-        return pack(gray)
+        return pack(gray, width: width, height: height)
     }
 
-    static func pack(_ gray: [UInt8]) -> Data {
+    private static func sheet(_ document: PrintDocument, pages numbers: [Int], setup: PageSetup) throws -> Data {
+        let width = setup.width
+        let height = setup.height
+        let printable = setup.printableSize
+        let pdf = document.isPDF ? CGPDFDocument(document.url as CFURL) : nil
+        var image: CGImage?
+        if !document.isPDF {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: max(width, height)
+            ]
+            if let source = CGImageSourceCreateWithURL(document.url as CFURL, nil) {
+                image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+            }
+        }
+        func pageSize(_ number: Int) throws -> CGSize {
+            if let image = image { return CGSize(width: image.width, height: image.height) }
+            guard let page = pdf?.page(at: number) else { throw PrintFailure(message: "无法读取 PDF 页面。") }
+            let box = page.getBoxRect(.cropBox)
+            guard box.width.isFinite, box.height.isFinite, box.width > 0, box.height > 0 else {
+                throw PrintFailure(message: "PDF 页面尺寸无效。")
+            }
+            return page.rotationAngle % 180 == 0 ? box.size : CGSize(width: box.height, height: box.width)
+        }
+        let grid = SheetGrid.best(count: setup.layout, sheet: printable, page: try pageSize(numbers[0]))
+        var gray = [UInt8](repeating: 255, count: width * height)
+        try gray.withUnsafeMutableBytes { memory in
+            guard let context = CGContext(data: memory.baseAddress, width: width, height: height,
+                                          bitsPerComponent: 8, bytesPerRow: width,
+                                          space: CGColorSpaceCreateDeviceGray(),
+                                          bitmapInfo: CGImageAlphaInfo.none.rawValue) else {
+                throw PrintFailure(message: "无法创建页面位图。")
+            }
+            context.setFillColor(gray: 1, alpha: 1)
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            context.scaleBy(x: CGFloat(width) / printable.width, y: CGFloat(height) / printable.height)
+            context.interpolationQuality = .high
+            if grid.rotated {
+                // The canvas's top edge runs along the sheet's left edge.
+                context.translateBy(x: printable.width, y: 0)
+                context.rotate(by: .pi / 2)
+            }
+            for (index, number) in numbers.enumerated() {
+                let cell = grid.cell(index, order: setup.layoutOrder).insetBy(dx: 4, dy: 4)
+                context.saveGState()
+                context.clip(to: cell)
+                if let image = image {
+                    let scale = min(cell.width / CGFloat(image.width), cell.height / CGFloat(image.height))
+                    let size = CGSize(width: CGFloat(image.width) * scale, height: CGFloat(image.height) * scale)
+                    context.draw(image, in: CGRect(x: cell.midX - size.width / 2, y: cell.midY - size.height / 2,
+                                                  width: size.width, height: size.height))
+                } else if let page = pdf?.page(at: number) {
+                    let size = try pageSize(number)
+                    let scale = min(cell.width / size.width, cell.height / size.height)
+                    // Scale explicitly: the PDF drawing transform never enlarges a page.
+                    context.translateBy(x: cell.midX, y: cell.midY)
+                    context.scaleBy(x: scale, y: scale)
+                    context.rotate(by: -CGFloat(page.rotationAngle) * .pi / 180)
+                    let box = page.getBoxRect(.cropBox)
+                    context.translateBy(x: -box.midX, y: -box.midY)
+                    context.clip(to: box)
+                    context.drawPDFPage(page)
+                }
+                context.restoreGState()
+            }
+        }
+        return pack(gray, width: width, height: height)
+    }
+
+    static func pack(_ gray: [UInt8], width: Int, height: Int) -> Data {
         precondition(gray.count == width * height)
+        let rowBytes = (width + 7) / 8
         let bayer = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
         var pixels = [UInt8](repeating: 0, count: rowBytes * height)
         for y in 0..<height {
@@ -246,57 +621,8 @@ enum PrintEngine {
 
     static func send(_ dataURL: URL, host: String, port: Int, interface: String = "",
                      progress: (String) -> Void) throws {
-        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
-        guard descriptor >= 0 else { throw socketError("无法创建打印连接") }
+        let descriptor = try connect(host: host, port: port, interface: interface)
         defer { close(descriptor) }
-        var noSignal: Int32 = 1
-        setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal,
-                   socklen_t(MemoryLayout<Int32>.size))
-        if !interface.isEmpty {
-            var index = if_nametoindex(interface)
-            guard index != 0 else {
-                throw PrintFailure(message: "选定的网卡已断开，未发送打印数据。")
-            }
-            guard setsockopt(descriptor, IPPROTO_IP, IP_BOUND_IF, &index,
-                             socklen_t(MemoryLayout<UInt32>.size)) == 0 else {
-                throw socketError("无法绑定选定网卡")
-            }
-        }
-        var address = sockaddr_in()
-        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        address.sin_family = sa_family_t(AF_INET)
-        guard (1...65535).contains(port),
-              host.withCString({ inet_pton(AF_INET, $0, &address.sin_addr) }) == 1 else {
-            throw PrintFailure(message: "打印地址或端口无效。")
-        }
-        address.sin_port = UInt16(port).bigEndian
-        let originalFlags = fcntl(descriptor, F_GETFL)
-        guard originalFlags >= 0, fcntl(descriptor, F_SETFL, originalFlags | O_NONBLOCK) == 0 else {
-            throw socketError("无法设置连接超时")
-        }
-        let connected = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        if connected != 0 {
-            guard errno == EINPROGRESS else { throw socketError("无法连接打印机") }
-            var event = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
-            guard poll(&event, 1, 5000) > 0 else {
-                throw PrintFailure(message: "连接超时，请检查打印机 IP、端口和路由器转发。")
-            }
-            var socketStatus: Int32 = 0
-            var length = socklen_t(MemoryLayout<Int32>.size)
-            guard getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &socketStatus, &length) == 0 else {
-                throw socketError("读取连接状态失败")
-            }
-            guard socketStatus == 0 else {
-                throw PrintFailure(message: "无法连接打印机：\(String(cString: strerror(socketStatus)))")
-            }
-        }
-        guard fcntl(descriptor, F_SETFL, originalFlags) == 0 else {
-            throw socketError("无法准备打印连接")
-        }
         var timeout = timeval(tv_sec: 15, tv_usec: 0)
         guard setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout,
                          socklen_t(MemoryLayout<timeval>.size)) == 0 else {
@@ -322,6 +648,65 @@ enum PrintEngine {
             progress("正在发送… \(ByteCountFormatter.string(fromByteCount: Int64(sent), countStyle: .file))")
         }
         shutdown(descriptor, SHUT_WR)
+    }
+
+    /// Opens a blocking TCP connection, bound to `interface` when one is given. The caller closes it.
+    static func connect(host: String, port: Int, interface: String = "",
+                        timeoutMilliseconds: Int32 = 5000) throws -> Int32 {
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw socketError("无法创建打印连接") }
+        var connected = false
+        defer { if !connected { close(descriptor) } }
+        var noSignal: Int32 = 1
+        setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal,
+                   socklen_t(MemoryLayout<Int32>.size))
+        if !interface.isEmpty {
+            var index = if_nametoindex(interface)
+            guard index != 0 else {
+                throw PrintFailure(message: "选定的网卡已断开，未发送打印数据。")
+            }
+            guard setsockopt(descriptor, IPPROTO_IP, IP_BOUND_IF, &index,
+                             socklen_t(MemoryLayout<UInt32>.size)) == 0 else {
+                throw socketError("无法绑定选定网卡")
+            }
+        }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        guard (1...65535).contains(port),
+              host.withCString({ inet_pton(AF_INET, $0, &address.sin_addr) }) == 1 else {
+            throw PrintFailure(message: "打印地址或端口无效。")
+        }
+        address.sin_port = UInt16(port).bigEndian
+        let originalFlags = fcntl(descriptor, F_GETFL)
+        guard originalFlags >= 0, fcntl(descriptor, F_SETFL, originalFlags | O_NONBLOCK) == 0 else {
+            throw socketError("无法设置连接超时")
+        }
+        let result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if result != 0 {
+            guard errno == EINPROGRESS else { throw socketError("无法连接打印机") }
+            var event = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+            guard poll(&event, 1, timeoutMilliseconds) > 0 else {
+                throw PrintFailure(message: "连接超时，请检查打印机 IP、端口和路由器转发。")
+            }
+            var socketStatus: Int32 = 0
+            var length = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &socketStatus, &length) == 0 else {
+                throw socketError("读取连接状态失败")
+            }
+            guard socketStatus == 0 else {
+                throw PrintFailure(message: "无法连接打印机：\(String(cString: strerror(socketStatus)))")
+            }
+        }
+        guard fcntl(descriptor, F_SETFL, originalFlags) == 0 else {
+            throw socketError("无法准备打印连接")
+        }
+        connected = true
+        return descriptor
     }
 
     static func socketError(_ prefix: String) -> PrintFailure {
