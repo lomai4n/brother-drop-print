@@ -42,6 +42,7 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let qualityPopup = NSPopUpButton()
     private let mediaPopup = NSPopUpButton()
     private let densityPopup = NSPopUpButton()
+    private let presetPopup = NSPopUpButton()
     private let setupSummary = NSTextField(labelWithString: "")
     private var selectedButton: NSButton!
     private var allButton: NSButton!
@@ -295,7 +296,12 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
             popup.target = self
             popup.action = #selector(setupChanged)
         }
-        let setupRow = NSStackView(views: [NSTextField(labelWithString: "纸张"), paperPopup, mediaPopup,
+        presetPopup.autoenablesItems = false
+        presetPopup.setAccessibilityLabel("打印预设")
+        presetPopup.target = self
+        presetPopup.action = #selector(presetChosen)
+        let setupRow = NSStackView(views: [NSTextField(labelWithString: "预设"), presetPopup,
+                                           NSTextField(labelWithString: "纸张"), paperPopup, mediaPopup,
                                            NSTextField(labelWithString: "质量"), qualityPopup, densityPopup])
         setupRow.spacing = 10
         root.addArrangedSubview(setupRow)
@@ -515,6 +521,69 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         mediaPopup.selectItem(at: MediaType.allCases.firstIndex(of: setup.media) ?? 0)
         densityPopup.selectItem(at: Array(PageSetup.densityRange).firstIndex(of: setup.density) ?? 6)
         setupSummary.stringValue = "\(setup.summary) · 黑白单面"
+        let list = PrintPreset.load()
+        presetPopup.removeAllItems()
+        presetPopup.addItems(withTitles: list.map(\.name))
+        if let match = PrintPreset.matching(setup, in: list), let index = list.firstIndex(of: match) {
+            presetPopup.selectItem(at: index)
+        } else {
+            presetPopup.addItem(withTitle: "自定义")
+            presetPopup.lastItem?.isEnabled = false
+            presetPopup.select(presetPopup.lastItem)
+        }
+        presetPopup.menu?.addItem(.separator())
+        presetPopup.addItem(withTitle: "将当前设置存为预设…")
+        presetPopup.lastItem?.tag = 1
+        presetPopup.addItem(withTitle: "删除当前预设…")
+        presetPopup.lastItem?.tag = 2
+        presetPopup.lastItem?.isEnabled = PrintPreset.matching(setup, in: list) != nil && list.count > 1
+    }
+
+    @objc private func presetChosen() {
+        let list = PrintPreset.load()
+        let current = formSetup()
+        switch presetPopup.selectedItem?.tag {
+        case 1: savePreset(current, list: list)
+        case 2: deletePreset(current, list: list)
+        default:
+            guard list.indices.contains(presetPopup.indexOfSelectedItem) else { return }
+            let setup = list[presetPopup.indexOfSelectedItem].setup
+            setup.save()
+            selectedJob?.setup = setup
+            show(setup)
+            flash.reloadResult()
+            return
+        }
+        show(current)
+    }
+
+    private func savePreset(_ setup: PageSetup, list: [PrintPreset]) {
+        let alert = NSAlert()
+        alert.messageText = "存为预设"
+        alert.informativeText = "\(setup.summary)\n同名预设会被替换。前三个预设会出现在拖放浮窗中。"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.placeholderString = "预设名称，例如：讲义"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            PrintPreset.store(try PrintPreset.saving(PrintPreset(name: field.stringValue, setup: setup), into: list))
+            status.stringValue = "已保存预设“\(field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines))”。"
+        } catch { status.stringValue = error.localizedDescription }
+    }
+
+    private func deletePreset(_ setup: PageSetup, list: [PrintPreset]) {
+        guard let preset = PrintPreset.matching(setup, in: list), list.count > 1 else { return }
+        let alert = NSAlert()
+        alert.messageText = "删除预设“\(preset.name)”？"
+        alert.informativeText = "只删除这个预设，不影响已加入列表的文件。"
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        PrintPreset.store(list.filter { $0 != preset })
+        status.stringValue = "已删除预设“\(preset.name)”。"
     }
 
     @objc private func setupChanged() {
@@ -733,7 +802,9 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         let file = selectedJob
         for field in [copies, firstPage, lastPage] { field.isEnabled = !busy && file != nil }
         rotate.isEnabled = !busy && file != nil
-        for popup in [paperPopup, qualityPopup, mediaPopup, densityPopup] { popup.isEnabled = !busy && file != nil }
+        for popup in [paperPopup, qualityPopup, mediaPopup, densityPopup, presetPopup] {
+            popup.isEnabled = !busy && file != nil
+        }
         fit.isEnabled = !busy && file?.document.isPDF == true
         selectedButton.isEnabled = !busy && file != nil
         allButton.isEnabled = !busy && jobs.contains { $0.state == .waiting }

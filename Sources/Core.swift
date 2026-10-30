@@ -46,7 +46,7 @@ struct PrintDocument {
     }
 }
 
-enum PaperSize: String, CaseIterable {
+enum PaperSize: String, CaseIterable, Codable {
     case a4 = "A4", a5 = "A5", a6 = "A6", b5 = "B5"
     case letter = "LETTER", legal = "LEGAL", executive = "EXECUTIVE"
 
@@ -76,7 +76,7 @@ enum PaperSize: String, CaseIterable {
     }
 }
 
-enum PrintQuality: String, CaseIterable {
+enum PrintQuality: String, CaseIterable, Codable {
     case standard, draft, tonerSave
 
     var label: String {
@@ -89,7 +89,7 @@ enum PrintQuality: String, CaseIterable {
     var dpi: Int { self == .draft ? 300 : 600 }
 }
 
-enum MediaType: String, CaseIterable {
+enum MediaType: String, CaseIterable, Codable {
     case plain = "PLAIN", thin = "THIN", thick = "THICK", thicker = "THICKER", bond = "BOND", envelope = "ENV"
 
     var label: String {
@@ -106,7 +106,7 @@ enum MediaType: String, CaseIterable {
 
 /// Paper and output settings for one job. Geometry follows the upstream brlaser margins
 /// (left 8, bottom 8, right 8, top 16 points), which A4 600 dpi output has confirmed.
-struct PageSetup: Equatable {
+struct PageSetup: Equatable, Codable {
     var paper = PaperSize.a4
     var quality = PrintQuality.standard
     var media = MediaType.plain
@@ -146,6 +146,49 @@ struct PageSetup: Equatable {
         defaults.set(quality.rawValue, forKey: "pageQuality")
         defaults.set(media.rawValue, forKey: "pageMedia")
         defaults.set(density, forKey: "pageDensity")
+    }
+}
+
+/// A named page setup, offered as a drop target on the floating card and as a quick choice.
+struct PrintPreset: Equatable, Codable {
+    var name: String
+    var setup: PageSetup
+
+    static let builtIn: [PrintPreset] = {
+        var draft = PageSetup()
+        draft.quality = .draft
+        var tonerSave = PageSetup()
+        tonerSave.quality = .tonerSave
+        return [PrintPreset(name: "标准", setup: PageSetup()),
+                PrintPreset(name: "草稿", setup: draft),
+                PrintPreset(name: "省墨", setup: tonerSave)]
+    }()
+
+    static func load(_ defaults: UserDefaults = .standard) -> [PrintPreset] {
+        guard let data = defaults.data(forKey: "printPresets"),
+              let presets = try? JSONDecoder().decode([PrintPreset].self, from: data),
+              !presets.isEmpty else { return builtIn }
+        return presets
+    }
+
+    static func store(_ presets: [PrintPreset], _ defaults: UserDefaults = .standard) {
+        guard !presets.isEmpty, let data = try? JSONEncoder().encode(presets) else { return }
+        defaults.set(data, forKey: "printPresets")
+    }
+
+    /// Adds or replaces by name; names are trimmed and must not be empty.
+    static func saving(_ preset: PrintPreset, into presets: [PrintPreset]) throws -> [PrintPreset] {
+        let name = preset.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name.count <= 12 else { throw PrintFailure(message: "预设名称需为 1–12 个字。") }
+        var result = presets
+        let named = PrintPreset(name: name, setup: preset.setup)
+        if let index = result.firstIndex(where: { $0.name == name }) { result[index] = named }
+        else { result.append(named) }
+        return result
+    }
+
+    static func matching(_ setup: PageSetup, in presets: [PrintPreset]) -> PrintPreset? {
+        presets.first { $0.setup == setup }
     }
 }
 

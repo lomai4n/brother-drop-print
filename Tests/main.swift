@@ -123,6 +123,20 @@ rememberedSetup.media = .thick
 rememberedSetup.density = 3
 rememberedSetup.save(preferencesStore)
 expect(PageSetup.saved(preferencesStore) == rememberedSetup, "page setup is remembered")
+expect(PrintPreset.load(preferencesStore) == PrintPreset.builtIn &&
+       PrintPreset.builtIn.map(\.name) == ["标准", "草稿", "省墨"], "built-in presets when none are saved")
+var presetList = try PrintPreset.saving(PrintPreset(name: "  讲义 ", setup: rememberedSetup), into: PrintPreset.builtIn)
+expect(presetList.count == 4 && presetList[3].name == "讲义", "a new preset is appended with a trimmed name")
+presetList = try PrintPreset.saving(PrintPreset(name: "草稿", setup: rememberedSetup), into: presetList)
+expect(presetList.count == 4 && presetList[1].setup == rememberedSetup, "a preset with the same name is replaced")
+expect(rejected { _ = try PrintPreset.saving(PrintPreset(name: "  ", setup: PageSetup()), into: presetList) },
+       "an empty preset name is rejected")
+PrintPreset.store(presetList, preferencesStore)
+expect(PrintPreset.load(preferencesStore) == presetList, "presets are stored")
+expect(PrintPreset.matching(rememberedSetup, in: presetList)?.name == "草稿" &&
+       PrintPreset.matching(draftA5, in: presetList) == nil, "the matching preset is found by setup")
+PrintPreset.store([], preferencesStore)
+expect(PrintPreset.load(preferencesStore) == presetList, "an empty preset list is never stored")
 let invalid = folder.appendingPathComponent("invalid.pdf")
 try Data("not a pdf".utf8).write(to: invalid)
 expect(rejected { _ = try PrintDocument(url: invalid) }, "malformed PDF rejected")

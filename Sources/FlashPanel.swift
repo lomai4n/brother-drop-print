@@ -57,6 +57,7 @@ final class FlashDropController: NSObject {
     var onAdd: (() -> Void)?
     var onClear: (([QueuedPrintFile]) -> Void)?
     var onSettings: (() -> Void)?
+    var presets: () -> [PrintPreset] = { PrintPreset.load() }
     private(set) var stage = FlashStage.hidden
     private(set) var files: [QueuedPrintFile] = []
 
@@ -79,6 +80,10 @@ final class FlashDropController: NSObject {
     private var pageRow: NSStackView!
     private let paperPopup = NSPopUpButton()
     private let qualityPopup = NSPopUpButton()
+    private let presetPopup = NSPopUpButton()
+    private let chipRow = NSStackView()
+    /// Set when the drop landed on a preset chip, for files that arrive from this drag.
+    private var pendingPreset: PrintPreset?
     private let printer = NSTextField(labelWithString: "")
     private let status = NSTextField(wrappingLabelWithString: "")
     private var printButton: NSButton!
@@ -96,7 +101,7 @@ final class FlashDropController: NSObject {
     private let cardHintText = "支持 PDF、PNG、JPEG · 本机转换，不经云端"
     private let width: CGFloat = 300
     private let pillSize = NSSize(width: 292, height: 36)
-    private let cardHeight: CGFloat = 330
+    private let cardHeight: CGFloat = 384
     private var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "org.brotherdropprint.app",
                                 category: "drag")
@@ -135,6 +140,7 @@ final class FlashDropController: NSObject {
     func beginDrag() {
         hiding?.cancel()
         hiding = nil
+        pendingPreset = nil
         guard stage == .hidden else { return }
         place()
         show(.pill)
@@ -189,6 +195,7 @@ final class FlashDropController: NSObject {
         panel.allowsKey = false
         stage = .hidden
         files.removeAll()
+        pendingPreset = nil
         zone.active = false
         zone.rejected = false
         if wasVisible { logger.notice("flash_hidden") }
@@ -197,9 +204,14 @@ final class FlashDropController: NSObject {
     // MARK: Result content
 
     func add(_ received: [QueuedPrintFile]) {
-        for file in received where !files.contains(where: { $0.id == file.id }) { files.append(file) }
+        for file in received where !files.contains(where: { $0.id == file.id }) {
+            if let preset = pendingPreset { file.setup = preset.setup }
+            files.append(file)
+        }
         if !received.isEmpty && !busy {
-            status.stringValue = PrinterPreferences().host.isEmpty ? "请先在设置中填写打印机地址。" : "确认份数和页码后点“打印”。"
+            let applied = pendingPreset.map { "已应用预设“\($0.name)”。" } ?? ""
+            status.stringValue = PrinterPreferences().host.isEmpty ? "请先在设置中填写打印机地址。" :
+                applied + "确认份数和页码后点“打印”。"
         }
         reloadResult()
     }
@@ -245,6 +257,16 @@ final class FlashDropController: NSObject {
         let setup = files.first?.setup ?? .saved()
         paperPopup.selectItem(at: PaperSize.allCases.firstIndex(of: setup.paper) ?? 0)
         qualityPopup.selectItem(at: PrintQuality.allCases.firstIndex(of: setup.quality) ?? 0)
+        let list = presets()
+        presetPopup.removeAllItems()
+        presetPopup.addItems(withTitles: list.map(\.name))
+        if let match = PrintPreset.matching(setup, in: list), let index = list.firstIndex(of: match) {
+            presetPopup.selectItem(at: index)
+        } else {
+            presetPopup.addItem(withTitle: "自定义")
+            presetPopup.lastItem?.isEnabled = false
+            presetPopup.select(presetPopup.lastItem)
+        }
         pageRow.isHidden = single == nil
         printer.stringValue = [printerSummary(), printerStatus].filter { !$0.isEmpty }.joined(separator: " · ")
         printer.textColor = printerSeverity == .error ? .systemRed :
@@ -254,7 +276,7 @@ final class FlashDropController: NSObject {
         printButton.title = sent ? "再次打印" : "打印"
         printButton.isEnabled = !busy && !files.isEmpty
         trash.isEnabled = !busy && !files.isEmpty
-        for control in [copies, firstPage, lastPage, stepper, paperPopup, qualityPopup] as [NSControl] {
+        for control in [copies, firstPage, lastPage, stepper, paperPopup, qualityPopup, presetPopup] as [NSControl] {
             control.isEnabled = !busy
         }
         fitResult()
@@ -285,7 +307,12 @@ final class FlashDropController: NSObject {
         result.isHidden = next != .result
         panel.allowsKey = next == .result
         if next == .pill { startCarousel() } else { carousel?.invalidate(); carousel = nil }
-        if next == .card { zone.rejected = false; cardHint.stringValue = cardHintText; cardHint.textColor = .secondaryLabelColor }
+        if next == .card {
+            zone.rejected = false
+            cardHint.stringValue = cardHintText
+            cardHint.textColor = .secondaryLabelColor
+            if previous != .card { rebuildChips() }
+        }
         if next == .result { reloadResult() }
         let size: NSSize
         switch next {
@@ -508,6 +535,15 @@ final class FlashDropController: NSObject {
         zone.widthAnchor.constraint(equalTo: card.widthAnchor, constant: -28).isActive = true
         zone.setContentHuggingPriority(.defaultLow, for: .vertical)
         zone.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        let chipTitle = NSTextField(labelWithString: "或拖到预设上，直接带上纸张和质量")
+        chipTitle.font = .systemFont(ofSize: 11)
+        chipTitle.textColor = .secondaryLabelColor
+        card.addArrangedSubview(chipTitle)
+        chipRow.distribution = .fillEqually
+        chipRow.spacing = 8
+        card.addArrangedSubview(chipRow)
+        chipRow.widthAnchor.constraint(equalTo: card.widthAnchor, constant: -28).isActive = true
+        chipRow.heightAnchor.constraint(equalToConstant: 34).isActive = true
         // Pinned to the top only: the card keeps its height while the panel is a capsule.
         card.translatesAutoresizingMaskIntoConstraints = false
         dropView.addSubview(card)
@@ -620,6 +656,13 @@ final class FlashDropController: NSObject {
         paperPopup.setAccessibilityLabel("纸张尺寸")
         qualityPopup.addItems(withTitles: PrintQuality.allCases.map(\.label))
         qualityPopup.setAccessibilityLabel("打印质量")
+        presetPopup.autoenablesItems = false
+        presetPopup.setAccessibilityLabel("打印预设")
+        for popup in [presetPopup, paperPopup, qualityPopup] {
+            popup.target = self
+            popup.action = #selector(setupChosen(_:))
+        }
+        full(NSStackView(views: [label("预设"), presetPopup, spacer()]))
         full(NSStackView(views: [label("纸张"), paperPopup, spacer()]))
         full(NSStackView(views: [label("质量"), qualityPopup, spacer()]))
         printer.font = .systemFont(ofSize: 12)
@@ -642,6 +685,57 @@ final class FlashDropController: NSObject {
 
     @objc private func stepped() { copies.stringValue = String(stepper.integerValue) }
 
+    @objc private func setupChosen(_ sender: NSPopUpButton) {
+        guard !files.isEmpty else { return }
+        var setup = files[0].setup
+        if sender === presetPopup {
+            let list = presets()
+            guard list.indices.contains(sender.indexOfSelectedItem) else { return }
+            setup = list[sender.indexOfSelectedItem].setup
+        } else {
+            setup.paper = PaperSize.allCases[max(paperPopup.indexOfSelectedItem, 0)]
+            setup.quality = PrintQuality.allCases[max(qualityPopup.indexOfSelectedItem, 0)]
+        }
+        for file in files { file.setup = setup }
+        setup.save()
+        reloadResult()
+    }
+
+    private func rebuildChips() {
+        for view in chipRow.arrangedSubviews { chipRow.removeArrangedSubview(view); view.removeFromSuperview() }
+        for preset in presets().prefix(3) {
+            let chip = FileDropView()
+            chip.rejectsUnsupported = true
+            chip.setAccessibilityLabel("拖到这里，使用预设“\(preset.name)”")
+            let title = NSTextField(labelWithString: preset.name)
+            title.font = .systemFont(ofSize: 12, weight: .medium)
+            title.lineBreakMode = .byTruncatingTail
+            title.translatesAutoresizingMaskIntoConstraints = false
+            chip.addSubview(title)
+            NSLayoutConstraint.activate([
+                title.centerXAnchor.constraint(equalTo: chip.centerXAnchor),
+                title.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
+                title.widthAnchor.constraint(lessThanOrEqualTo: chip.widthAnchor, constant: -10)
+            ])
+            chip.toolTip = preset.setup.summary
+            chip.onHover = { [weak self] active in
+                guard let self = self else { return }
+                if active { self.collapsing?.cancel(); self.collapsing = nil }
+                else if self.stage == .card { self.scheduleCollapse() }
+            }
+            chip.onRejected = { [weak self] reason in self?.reject(reason) }
+            // Same receipt path as the main area; only the preset differs.
+            chip.onAccepted = { [weak self] in
+                self?.pendingPreset = preset
+                self?.dropView.onAccepted?()
+            }
+            chip.onFiles = { [weak self] urls, directory in self?.dropView.onFiles?(urls, directory) }
+            chip.onReceiving = { [weak self] directory in self?.dropView.onReceiving?(directory) }
+            chip.onError = { [weak self] message in self?.dropView.onError?(message) }
+            chipRow.addArrangedSubview(chip)
+        }
+    }
+
     private func printTapped() {
         guard !files.isEmpty else { return }
         let count = Int(copies.stringValue.trimmingCharacters(in: .whitespaces)) ?? 0
@@ -658,11 +752,7 @@ final class FlashDropController: NSObject {
                 try PrintOptions.validatePages(copies: count, firstPage: file.firstPage,
                                                lastPage: file.lastPage, pageCount: file.document.pageCount)
             }
-            for file in files {
-                file.copies = count
-                file.setup.paper = PaperSize.allCases[max(paperPopup.indexOfSelectedItem, 0)]
-                file.setup.quality = PrintQuality.allCases[max(qualityPopup.indexOfSelectedItem, 0)]
-            }
+            for file in files { file.copies = count }
             files[0].setup.save()
             onPrint?(files)
         } catch { status.stringValue = error.localizedDescription }
