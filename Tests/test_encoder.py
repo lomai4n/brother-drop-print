@@ -8,6 +8,11 @@ import unittest
 ENCODER = Path(sys.argv.pop(1)).resolve()
 WIDTH, HEIGHT, ROW_BYTES = 4825, 6817, 604
 HEADER = f"P4\n{WIDTH} {HEIGHT}\n".encode()
+A4_STANDARD = ["A4", "600", "0", "0", "PLAIN"]
+
+
+def blank_page(width, height):
+    return f"P4\n{width} {height}\n".encode() + bytes((width + 7) // 8 * height)
 
 
 class EncoderTests(unittest.TestCase):
@@ -21,11 +26,40 @@ class EncoderTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def encode(self, copies="1"):
+    def encode(self, copies="1", setup=None):
         return subprocess.run(
-            [str(ENCODER), str(self.output), copies, str(self.page)],
+            [str(ENCODER), str(self.output), copies, *(setup or A4_STANDARD), str(self.page)],
             capture_output=True, timeout=20,
         )
+
+    def test_a4_header_matches_v1_output(self):
+        self.assertEqual(self.encode().returncode, 0)
+        data = self.output.read_bytes()
+        for line in (b"@PJL SET RESOLUTION = 600", b"@PJL SET ECONOMODE = OFF",
+                     b"@PJL SET MEDIATYPE = PLAIN", b"@PJL SET DENSITY=0", b"@PJL SET PAPER = A4"):
+            self.assertIn(line, data)
+
+    def test_a5_draft_toner_save_header(self):
+        # A5 at 300 dpi: (420 - 16) and (595 - 24) points.
+        self.page.write_bytes(blank_page(1683, 2379))
+        result = self.encode(setup=["A5", "300", "1", "-2", "THIN"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = self.output.read_bytes()
+        for line in (b"@PJL SET RESOLUTION = 300", b"@PJL SET ECONOMODE = ON",
+                     b"@PJL SET MEDIATYPE = THIN", b"@PJL SET DENSITY=-2", b"@PJL SET PAPER = A5"):
+            self.assertIn(line, data)
+
+    def test_raster_must_match_selected_paper(self):
+        result = self.encode(setup=["LETTER", "600", "0", "0", "PLAIN"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.output.exists())
+
+    def test_invalid_setup_is_rejected(self):
+        for setup in (["A3", "600", "0", "0", "PLAIN"], ["A4", "1200", "0", "0", "PLAIN"],
+                      ["A4", "600", "2", "0", "PLAIN"], ["A4", "600", "0", "7", "PLAIN"],
+                      ["A4", "600", "0", "0", "GLOSSY"]):
+            self.assertNotEqual(self.encode(setup=setup).returncode, 0, setup)
+            self.assertFalse(self.output.exists())
 
     def test_blank_page_is_a_complete_bounded_job(self):
         result = self.encode()

@@ -119,6 +119,16 @@ SNMP OID（UDP 161）：
 - PJL 查询走哪个端口、能否在 9100 上双向回读，都还**待核**。
 - Brother 状态码表还没恢复。先显示面板文字，再逐步补充状态码含义。
 
+## 5a. 已实现（V1.2 第 2 步）
+
+- 编码器参数：`brother-encoder output.prn copies paper dpi economode density media page.pbm …`。
+  纸张、介质和浓度的取值沿用 brlaser 上游的 PJL 名称；分辨率只开放 300 和 600。
+- 栅格尺寸 =（纸张尺寸 − 左右 16 pt、上下 24 pt）× dpi / 72，四舍五入。
+  A4 600 dpi 仍是 4825 × 6817，输出与 V1.1 逐字节相同。
+- 界面：工作台提供纸张、纸张类型、质量、浓度；浮窗提供纸张和质量。
+  质量合并为标准 600 dpi、草稿 300 dpi、省墨 600 dpi 三档。
+- 未采用 ADK 的 PCL 纸张代码 `ESC&l#A`，继续用 brlaser 已验证的 `@PJL SET PAPER`。
+
 ## 6. 实机验证清单（DCP-1618W）
 
 1. 测试页基线：保持当前头部，确认出纸与 V1.1 一致。

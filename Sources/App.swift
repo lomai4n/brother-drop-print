@@ -33,7 +33,12 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let firstPage = NSTextField(string: "1")
     private let lastPage = NSTextField(string: "1")
     private let rotate = NSButton(checkboxWithTitle: "输出旋转 90°", target: nil, action: nil)
-    private let fit = NSButton(checkboxWithTitle: "适应 A4 可打印区域", target: nil, action: nil)
+    private let fit = NSButton(checkboxWithTitle: "适应纸张可打印区域", target: nil, action: nil)
+    private let paperPopup = NSPopUpButton()
+    private let qualityPopup = NSPopUpButton()
+    private let mediaPopup = NSPopUpButton()
+    private let densityPopup = NSPopUpButton()
+    private let setupSummary = NSTextField(labelWithString: "")
     private var selectedButton: NSButton!
     private var allButton: NSButton!
     private var removeButton: NSButton!
@@ -266,6 +271,21 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
         root.addArrangedSubview(options)
         options.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        paperPopup.addItems(withTitles: PaperSize.allCases.map(\.label))
+        qualityPopup.addItems(withTitles: PrintQuality.allCases.map(\.label))
+        mediaPopup.addItems(withTitles: MediaType.allCases.map(\.label))
+        densityPopup.addItems(withTitles: PageSetup.densityRange.map { $0 == 0 ? "浓度 0" : String(format: "浓度 %+d", $0) })
+        for (popup, label) in [(paperPopup, "纸张尺寸"), (qualityPopup, "打印质量"),
+                               (mediaPopup, "纸张类型"), (densityPopup, "碳粉浓度")] {
+            popup.setAccessibilityLabel(label)
+            popup.target = self
+            popup.action = #selector(setupChanged)
+        }
+        let setupRow = NSStackView(views: [NSTextField(labelWithString: "纸张"), paperPopup, mediaPopup,
+                                           NSTextField(labelWithString: "质量"), qualityPopup, densityPopup])
+        setupRow.spacing = 10
+        root.addArrangedSubview(setupRow)
+        setupRow.heightAnchor.constraint(equalToConstant: 26).isActive = true
         status.font = .systemFont(ofSize: 12)
         status.maximumNumberOfLines = 2
         status.preferredMaxLayoutWidth = 980
@@ -281,14 +301,14 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         selectedButton.keyEquivalent = "\r"
         allButton = NSButton(title: "打印全部待处理", target: self, action: #selector(printWaiting))
         let test = NSButton(title: "准备校准页", target: self, action: #selector(testPage))
-        let paper = NSTextField(labelWithString: "A4 · 600 dpi · 黑白单面")
-        paper.textColor = .secondaryLabelColor
-        paper.font = .systemFont(ofSize: 11)
-        let actions = NSStackView(views: [test, paper, NSView(), allButton, selectedButton])
+        setupSummary.textColor = .secondaryLabelColor
+        setupSummary.font = .systemFont(ofSize: 11)
+        let actions = NSStackView(views: [test, setupSummary, NSView(), allButton, selectedButton])
         actions.spacing = 12
         root.addArrangedSubview(actions)
         actions.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
         actions.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        show(PageSetup.saved())
         updateControls()
     }
 
@@ -431,6 +451,7 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
             lastPage.stringValue = String(file.lastPage)
             rotate.state = file.rotate ? .on : .off
             fit.state = file.fit ? .on : .off
+            show(file.setup)
             if file.document.isPDF {
                 pdf.document = PDFDocument(url: file.document.url)
                 pdf.isHidden = false
@@ -460,6 +481,32 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         file.lastPage = last
         file.rotate = rotate.state == .on
         file.fit = fit.state == .on
+        file.setup = formSetup()
+    }
+
+    private func formSetup() -> PageSetup {
+        var setup = PageSetup()
+        setup.paper = PaperSize.allCases[max(paperPopup.indexOfSelectedItem, 0)]
+        setup.quality = PrintQuality.allCases[max(qualityPopup.indexOfSelectedItem, 0)]
+        setup.media = MediaType.allCases[max(mediaPopup.indexOfSelectedItem, 0)]
+        setup.density = Array(PageSetup.densityRange)[max(densityPopup.indexOfSelectedItem, 0)]
+        return setup
+    }
+
+    private func show(_ setup: PageSetup) {
+        paperPopup.selectItem(at: PaperSize.allCases.firstIndex(of: setup.paper) ?? 0)
+        qualityPopup.selectItem(at: PrintQuality.allCases.firstIndex(of: setup.quality) ?? 0)
+        mediaPopup.selectItem(at: MediaType.allCases.firstIndex(of: setup.media) ?? 0)
+        densityPopup.selectItem(at: Array(PageSetup.densityRange).firstIndex(of: setup.density) ?? 6)
+        setupSummary.stringValue = "\(setup.summary) · 黑白单面"
+    }
+
+    @objc private func setupChanged() {
+        let setup = formSetup()
+        setup.save()
+        selectedJob?.setup = setup
+        show(setup)
+        flash.reloadResult()
     }
 
     @objc private func chooseFiles() {
@@ -593,6 +640,7 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         let file = selectedJob
         for field in [copies, firstPage, lastPage] { field.isEnabled = !busy && file != nil }
         rotate.isEnabled = !busy && file != nil
+        for popup in [paperPopup, qualityPopup, mediaPopup, densityPopup] { popup.isEnabled = !busy && file != nil }
         fit.isEnabled = !busy && file?.document.isPDF == true
         selectedButton.isEnabled = !busy && file != nil
         allButton.isEnabled = !busy && jobs.contains { $0.state == .waiting }
@@ -656,6 +704,9 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
             accept([url])
             selectedJob?.fit = false
             fit.state = .off
+            // The calibration sheet is drawn on A4.
+            selectedJob?.setup.paper = .a4
+            if let setup = selectedJob?.setup { show(setup) }
             status.stringValue = "校准页已准备，尚未发送。打印后检查边框、方向、灰阶与 100 mm 标尺。"
         } catch { status.stringValue = error.localizedDescription }
     }

@@ -99,14 +99,30 @@ expect(dragState.observe(pressed: true, changeCount: 14, hasFileType: true) == .
 let raster = try PrintEngine.raster(document, page: 1, rotate: false, fit: true)
 let header = Data("P4\n4825 6817\n".utf8)
 expect(raster.starts(with: header), "PBM header")
-expect(raster.count == header.count + PrintEngine.rowBytes * PrintEngine.height, "exact raster length")
+expect(raster.count == header.count + PageSetup().rowBytes * PageSetup().height, "exact raster length")
 let body = Array(raster.dropFirst(header.count))
-let topBlack = body[PrintEngine.rowBytes * 100..<(PrintEngine.rowBytes * 101)].reduce(0) { $0 + $1.nonzeroBitCount }
-let bottomBlack = body[PrintEngine.rowBytes * 6700..<(PrintEngine.rowBytes * 6701)].reduce(0) { $0 + $1.nonzeroBitCount }
+let topBlack = body[PageSetup().rowBytes * 100..<(PageSetup().rowBytes * 101)].reduce(0) { $0 + $1.nonzeroBitCount }
+let bottomBlack = body[PageSetup().rowBytes * 6700..<(PageSetup().rowBytes * 6701)].reduce(0) { $0 + $1.nonzeroBitCount }
 expect(topBlack > 4000 && bottomBlack == 0, "PDF top stays at the top of the printer raster")
-for row in 0..<PrintEngine.height {
-    expect(body[(row + 1) * PrintEngine.rowBytes - 1] & 0x7f == 0, "white row padding")
+for row in 0..<PageSetup().height {
+    expect(body[(row + 1) * PageSetup().rowBytes - 1] & 0x7f == 0, "white row padding")
 }
+expect(PageSetup().width == 4825 && PageSetup().height == 6817 && PageSetup().rowBytes == 604,
+       "A4 600 dpi keeps the calibrated V1 raster size")
+var draftA5 = PageSetup()
+draftA5.paper = .a5
+draftA5.quality = .draft
+let a5Raster = try PrintEngine.raster(document, page: 1, rotate: false, fit: true, setup: draftA5)
+let a5Header = Data("P4\n1683 2379\n".utf8)
+expect(a5Raster.starts(with: a5Header) && a5Raster.count == a5Header.count + 211 * 2379, "A5 draft raster size")
+expect(draftA5.encoderArguments == ["A5", "300", "0", "0", "PLAIN"], "encoder receives the page setup")
+var rememberedSetup = PageSetup()
+rememberedSetup.paper = .letter
+rememberedSetup.quality = .tonerSave
+rememberedSetup.media = .thick
+rememberedSetup.density = 3
+rememberedSetup.save(preferencesStore)
+expect(PageSetup.saved(preferencesStore) == rememberedSetup, "page setup is remembered")
 let invalid = folder.appendingPathComponent("invalid.pdf")
 try Data("not a pdf".utf8).write(to: invalid)
 expect(rejected { _ = try PrintDocument(url: invalid) }, "malformed PDF rejected")
@@ -167,9 +183,9 @@ try FileManager.default.createSymbolicLink(at: escaped, withDestinationURL: pdfU
 expect(!FileDropView.validReceivedURL(escaped, directory: receivedDirectory),
        "promised file symlink cannot escape its private destination")
 let imageRaster = Array(try PrintEngine.raster(imageDocument, page: 1, rotate: false, fit: true).dropFirst(header.count))
-let middleRow = PrintEngine.height / 2 * PrintEngine.rowBytes
-expect(imageRaster[middleRow + (PrintEngine.width / 4) / 8] == 255, "black image pixels")
-expect(imageRaster[middleRow + (PrintEngine.width * 3 / 4) / 8] == 0, "transparent image background stays white")
+let middleRow = PageSetup().height / 2 * PageSetup().rowBytes
+expect(imageRaster[middleRow + (PageSetup().width / 4) / 8] == 255, "black image pixels")
+expect(imageRaster[middleRow + (PageSetup().width * 3 / 4) / 8] == 0, "transparent image background stays white")
 
 let listener = socket(AF_INET, SOCK_STREAM, 0)
 expect(listener >= 0, "create loopback listener")
@@ -229,7 +245,15 @@ if CommandLine.arguments.count > 1 {
     expect(bytes.range(of: Data("\u{1b}*b1030m".utf8)) != nil, "1030 raster mode")
     expect(bytes.range(of: Data("@PJL EOJ".utf8)) != nil, "complete job terminator")
     job.remove()
-    let queued = QueuedPrintFile(document: document)
+    var a5Options = valid
+    a5Options.setup = draftA5
+    let a5Job = try PrintEngine.prepare(document, options: a5Options, encoder: encoder, progress: { _ in })
+    let a5Bytes = try Data(contentsOf: a5Job.dataURL)
+    expect(a5Bytes.range(of: Data("@PJL SET PAPER = A5".utf8)) != nil &&
+           a5Bytes.range(of: Data("@PJL SET RESOLUTION = 300".utf8)) != nil,
+           "A5 draft job reaches the encoder with its setup")
+    a5Job.remove()
+    let queued = QueuedPrintFile(document: document, setup: draftA5)
     queued.copies = 2
     queued.firstPage = 2
     queued.lastPage = 2
@@ -242,6 +266,7 @@ if CommandLine.arguments.count > 1 {
     expect(task.id == queued.id && task.options.copies == 2 && task.options.firstPage == 2 &&
            task.options.lastPage == 2 && task.options.rotate && task.options.interface == "lo0",
            "queue snapshots retain per-file options and selected network binding")
+    expect(task.options.setup == draftA5, "queue snapshots retain the page setup")
     var events: [PrintBatchEvent] = []
     let second = PrintTask(id: UUID(), document: document, options: valid)
     expect(rejected {

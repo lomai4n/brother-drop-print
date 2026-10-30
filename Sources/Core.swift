@@ -46,6 +46,109 @@ struct PrintDocument {
     }
 }
 
+enum PaperSize: String, CaseIterable {
+    case a4 = "A4", a5 = "A5", a6 = "A6", b5 = "B5"
+    case letter = "LETTER", legal = "LEGAL", executive = "EXECUTIVE"
+
+    var label: String {
+        switch self {
+        case .a4: return "A4"
+        case .a5: return "A5"
+        case .a6: return "A6"
+        case .b5: return "B5"
+        case .letter: return "Letter"
+        case .legal: return "Legal"
+        case .executive: return "Executive"
+        }
+    }
+
+    /// Size in points; must match the table in native/Encoder.cpp.
+    var points: CGSize {
+        switch self {
+        case .a4: return CGSize(width: 595, height: 842)
+        case .a5: return CGSize(width: 420, height: 595)
+        case .a6: return CGSize(width: 297, height: 420)
+        case .b5: return CGSize(width: 499, height: 709)
+        case .letter: return CGSize(width: 612, height: 792)
+        case .legal: return CGSize(width: 612, height: 1008)
+        case .executive: return CGSize(width: 522, height: 756)
+        }
+    }
+}
+
+enum PrintQuality: String, CaseIterable {
+    case standard, draft, tonerSave
+
+    var label: String {
+        switch self {
+        case .standard: return "标准 600 dpi"
+        case .draft: return "草稿 300 dpi"
+        case .tonerSave: return "省墨 600 dpi"
+        }
+    }
+    var dpi: Int { self == .draft ? 300 : 600 }
+}
+
+enum MediaType: String, CaseIterable {
+    case plain = "PLAIN", thin = "THIN", thick = "THICK", thicker = "THICKER", bond = "BOND", envelope = "ENV"
+
+    var label: String {
+        switch self {
+        case .plain: return "普通纸"
+        case .thin: return "薄纸"
+        case .thick: return "厚纸"
+        case .thicker: return "较厚纸"
+        case .bond: return "证券纸"
+        case .envelope: return "信封"
+        }
+    }
+}
+
+/// Paper and output settings for one job. Geometry follows the upstream brlaser margins
+/// (left 8, bottom 8, right 8, top 16 points), which A4 600 dpi output has confirmed.
+struct PageSetup: Equatable {
+    var paper = PaperSize.a4
+    var quality = PrintQuality.standard
+    var media = MediaType.plain
+    var density = 0
+
+    static let marginLeft: CGFloat = 8
+    static let marginBottom: CGFloat = 8
+    static let densityRange = -6...6
+
+    var printableSize: CGSize {
+        CGSize(width: paper.points.width - 16, height: paper.points.height - 24)
+    }
+    var width: Int { Int((printableSize.width * CGFloat(quality.dpi) / 72).rounded()) }
+    var height: Int { Int((printableSize.height * CGFloat(quality.dpi) / 72).rounded()) }
+    var rowBytes: Int { (width + 7) / 8 }
+    var summary: String { "\(paper.label) · \(quality.label) · \(media.label)" }
+
+    var encoderArguments: [String] {
+        [paper.rawValue, String(quality.dpi), quality == .tonerSave ? "1" : "0", String(density), media.rawValue]
+    }
+
+    /// The last setup used, so new files start from it.
+    static func saved(_ defaults: UserDefaults = .standard) -> PageSetup {
+        var setup = PageSetup()
+        if let value = defaults.string(forKey: "pagePaper"), let paper = PaperSize(rawValue: value) { setup.paper = paper }
+        if let value = defaults.string(forKey: "pageQuality"), let quality = PrintQuality(rawValue: value) {
+            setup.quality = quality
+        }
+        if let value = defaults.string(forKey: "pageMedia"), let media = MediaType(rawValue: value) { setup.media = media }
+        let density = defaults.integer(forKey: "pageDensity")
+        if densityRange.contains(density) { setup.density = density }
+        return setup
+    }
+
+    func save(_ defaults: UserDefaults = .standard) {
+        defaults.set(paper.rawValue, forKey: "pagePaper")
+        defaults.set(quality.rawValue, forKey: "pageQuality")
+        defaults.set(media.rawValue, forKey: "pageMedia")
+        defaults.set(density, forKey: "pageDensity")
+    }
+}
+
 struct PrintOptions {
     let host: String
     let port: Int
@@ -55,6 +158,7 @@ struct PrintOptions {
     let rotate: Bool
     let fit: Bool
     var interface: String = ""
+    var setup = PageSetup()
 
     static func validateAddress(host: String, port: Int) throws {
         var address = in_addr()
@@ -92,14 +196,9 @@ struct PreparedJob {
 }
 
 enum PrintEngine {
-    // shortcut: A4/600 dpi follows the upstream DCP-1600/1610 profile; add other media after hardware calibration.
-    static let width = 4825
-    static let height = 6817
-    static let rowBytes = 604
+    // The calibration page stays A4.
     static let paperWidth: CGFloat = 595
     static let paperHeight: CGFloat = 842
-    static let printableWidth: CGFloat = 579
-    static let printableHeight: CGFloat = 818
 
     static func networkAdapters() -> [NetworkAdapter] {
         var addresses: UnsafeMutablePointer<ifaddrs>?
@@ -138,7 +237,8 @@ enum PrintEngine {
                                                attributes: [.posixPermissions: 0o700])
         do {
             let selectedPages = Array(options.firstPage...options.lastPage)
-            let estimatedBytes = Int64(selectedPages.count) * Int64(rowBytes * height)
+            let setup = options.setup
+            let estimatedBytes = Int64(selectedPages.count) * Int64(setup.rowBytes * setup.height)
                 * (1 + 2 * Int64(options.copies))
             let attributes = try FileManager.default.attributesOfFileSystem(forPath: directory.path)
             let free = (attributes[.systemFreeSize] as? NSNumber)?.int64Value ?? 0
@@ -149,14 +249,15 @@ enum PrintEngine {
             for (index, page) in selectedPages.enumerated() {
                 progress("正在转换第 \(index + 1)/\(selectedPages.count) 页…")
                 let target = directory.appendingPathComponent("page-\(page).pbm")
-                try raster(document, page: page, rotate: options.rotate, fit: options.fit).write(to: target)
+                try raster(document, page: page, rotate: options.rotate, fit: options.fit, setup: setup)
+                    .write(to: target)
                 pages.append(target)
             }
             progress("正在生成打印数据…")
             let dataURL = directory.appendingPathComponent("job.prn")
             let process = Process()
             process.executableURL = encoder
-            process.arguments = [dataURL.path, String(options.copies)] + pages.map(\.path)
+            process.arguments = [dataURL.path, String(options.copies)] + setup.encoderArguments + pages.map(\.path)
             let errors = Pipe()
             process.standardError = errors
             try process.run()
@@ -177,10 +278,14 @@ enum PrintEngine {
     }
 
     static func raster(_ document: PrintDocument, page number: Int,
-                       rotate: Bool, fit: Bool) throws -> Data {
+                       rotate: Bool, fit: Bool, setup: PageSetup = PageSetup()) throws -> Data {
         guard (1...document.pageCount).contains(number) else {
             throw PrintFailure(message: "文档页码无效。")
         }
+        let width = setup.width
+        let height = setup.height
+        let printableWidth = setup.printableSize.width
+        let printableHeight = setup.printableSize.height
         var gray = [UInt8](repeating: 255, count: width * height)
         try gray.withUnsafeMutableBytes { memory in
             guard let context = CGContext(data: memory.baseAddress, width: width, height: height,
@@ -208,7 +313,8 @@ enum PrintEngine {
                         rect: CGRect(x: 0, y: 0, width: printableWidth, height: printableHeight),
                         rotate: rotate ? 90 : 0, preserveAspectRatio: true))
                 } else {
-                    context.translateBy(x: paperWidth / 2 - 8, y: paperHeight / 2 - 8)
+                    context.translateBy(x: setup.paper.points.width / 2 - PageSetup.marginLeft,
+                                        y: setup.paper.points.height / 2 - PageSetup.marginBottom)
                     context.rotate(by: CGFloat(page.rotationAngle + (rotate ? 90 : 0)) * .pi / 180)
                     context.translateBy(x: -box.midX, y: -box.midY)
                 }
@@ -233,11 +339,12 @@ enum PrintEngine {
                                               width: CGFloat(image.width), height: CGFloat(image.height)))
             }
         }
-        return pack(gray)
+        return pack(gray, width: width, height: height)
     }
 
-    static func pack(_ gray: [UInt8]) -> Data {
+    static func pack(_ gray: [UInt8], width: Int, height: Int) -> Data {
         precondition(gray.count == width * height)
+        let rowBytes = (width + 7) / 8
         let bayer = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
         var pixels = [UInt8](repeating: 0, count: rowBytes * height)
         for y in 0..<height {

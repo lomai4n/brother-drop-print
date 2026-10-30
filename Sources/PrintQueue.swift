@@ -18,10 +18,12 @@ final class QueuedPrintFile {
     var lastPage: Int
     var rotate = false
     var fit = true
+    var setup: PageSetup
     var error: String?
 
-    init(document: PrintDocument) {
+    init(document: PrintDocument, setup: PageSetup = .saved()) {
         self.document = document
+        self.setup = setup
         lastPage = document.pageCount
     }
 
@@ -29,7 +31,7 @@ final class QueuedPrintFile {
         PrintTask(id: id, document: document, options: PrintOptions(
             host: connection.host, port: connection.port, copies: copies,
             firstPage: firstPage, lastPage: lastPage, rotate: rotate, fit: fit,
-            interface: connection.interface))
+            interface: connection.interface, setup: setup))
     }
 }
 

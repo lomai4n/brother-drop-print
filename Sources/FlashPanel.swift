@@ -77,6 +77,8 @@ final class FlashDropController: NSObject {
     private let firstPage = NSTextField(string: "1")
     private let lastPage = NSTextField(string: "1")
     private var pageRow: NSStackView!
+    private let paperPopup = NSPopUpButton()
+    private let qualityPopup = NSPopUpButton()
     private let printer = NSTextField(labelWithString: "")
     private let status = NSTextField(wrappingLabelWithString: "")
     private var printButton: NSButton!
@@ -232,13 +234,18 @@ final class FlashDropController: NSObject {
             if let file = files.first { copies.stringValue = String(file.copies) }
         }
         stepper.integerValue = Int(copies.stringValue) ?? 1
+        let setup = files.first?.setup ?? .saved()
+        paperPopup.selectItem(at: PaperSize.allCases.firstIndex(of: setup.paper) ?? 0)
+        qualityPopup.selectItem(at: PrintQuality.allCases.firstIndex(of: setup.quality) ?? 0)
         pageRow.isHidden = single == nil
         printer.stringValue = printerSummary()
         let sent = !files.isEmpty && files.allSatisfy { $0.state == .sent }
         printButton.title = sent ? "再次打印" : "打印"
         printButton.isEnabled = !busy && !files.isEmpty
         trash.isEnabled = !busy && !files.isEmpty
-        for control in [copies, firstPage, lastPage, stepper] as [NSControl] { control.isEnabled = !busy }
+        for control in [copies, firstPage, lastPage, stepper, paperPopup, qualityPopup] as [NSControl] {
+            control.isEnabled = !busy
+        }
         fitResult()
     }
 
@@ -598,6 +605,12 @@ final class FlashDropController: NSObject {
         numeric(lastPage, "结束页码")
         pageRow = NSStackView(views: [label("页码"), firstPage, NSTextField(labelWithString: "至"), lastPage, spacer()])
         full(pageRow)
+        paperPopup.addItems(withTitles: PaperSize.allCases.map(\.label))
+        paperPopup.setAccessibilityLabel("纸张尺寸")
+        qualityPopup.addItems(withTitles: PrintQuality.allCases.map(\.label))
+        qualityPopup.setAccessibilityLabel("打印质量")
+        full(NSStackView(views: [label("纸张"), paperPopup, spacer()]))
+        full(NSStackView(views: [label("质量"), qualityPopup, spacer()]))
         printer.font = .systemFont(ofSize: 12)
         printer.lineBreakMode = .byTruncatingTail
         full(NSStackView(views: [label("打印机"), printer, spacer()]))
@@ -634,7 +647,12 @@ final class FlashDropController: NSObject {
                 try PrintOptions.validatePages(copies: count, firstPage: file.firstPage,
                                                lastPage: file.lastPage, pageCount: file.document.pageCount)
             }
-            for file in files { file.copies = count }
+            for file in files {
+                file.copies = count
+                file.setup.paper = PaperSize.allCases[max(paperPopup.indexOfSelectedItem, 0)]
+                file.setup.quality = PrintQuality.allCases[max(qualityPopup.indexOfSelectedItem, 0)]
+            }
+            files[0].setup.save()
             onPrint?(files)
         } catch { status.stringValue = error.localizedDescription }
     }
