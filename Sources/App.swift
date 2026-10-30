@@ -26,6 +26,10 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let emptyPreview = NSTextField(labelWithString: "选中文件后在这里预览")
     private let listTitle = NSTextField(labelWithString: "文件列表")
     private let connection = NSTextField(labelWithString: "")
+    private let printerState = NSTextField(labelWithString: "")
+    private var statusQuerying = false
+    private var lastStatusQuery = Date.distantPast
+    private var confirmation: CancellationToken?
     private let filename = NSTextField(labelWithString: "尚未选择文件")
     private let status = NSTextField(wrappingLabelWithString: "拖入 PDF 或图片，选择参数后打印。")
     private let progress = NSProgressIndicator()
@@ -130,6 +134,7 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         view.onAccepted = { [weak self] in
             self?.fileChooser?.cancel(nil)
             self?.flash.showResult()
+            self?.refreshPrinterStatus()
             self?.logger.notice("file_drop_accepted target=flash")
         }
         view.onFiles = { [weak self] urls, directory in
@@ -194,7 +199,16 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         title.font = .systemFont(ofSize: 24, weight: .semibold)
         connection.font = .systemFont(ofSize: 11)
         connection.textColor = .secondaryLabelColor
-        let titles = NSStackView(views: [title, connection])
+        printerState.font = .systemFont(ofSize: 11)
+        printerState.textColor = .secondaryLabelColor
+        let refresh = NSButton(image: NSImage(systemSymbolName: "arrow.clockwise",
+                                              accessibilityDescription: "刷新打印机状态")!,
+                               target: self, action: #selector(refreshPrinterStatus))
+        refresh.isBordered = false
+        refresh.toolTip = "刷新打印机状态"
+        let connectionRow = NSStackView(views: [connection, printerState, refresh])
+        connectionRow.spacing = 6
+        let titles = NSStackView(views: [title, connectionRow])
         titles.orientation = .vertical
         titles.alignment = .leading
         titles.spacing = 4
@@ -395,6 +409,8 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         else { dragMonitor.stop(); flash.cancelDrag() }
         let route = preferences.interface.isEmpty ? "系统路由" : "绑定 \(preferences.interface)"
         connection.stringValue = preferences.host.isEmpty ? "请先在设置中连接打印机" : "打印机已配置 · \(route)"
+        lastStatusQuery = .distantPast
+        refreshPrinterStatus()
         updateControls()
     }
 
@@ -584,20 +600,35 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
             guard let encoder = Bundle.main.url(forResource: "brother-encoder", withExtension: nil) else {
                 throw PrintFailure(message: "找不到编码器，请重新构建应用。")
             }
+            confirmation?.cancel()
+            confirmation = nil
             setBusy(true)
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                // Read before sending: a PJL query must not share the print port with the job.
+                let baseline = PrinterStatusClient.query(host: preferences.host, printPort: preferences.port,
+                                                         interface: preferences.interface,
+                                                         mode: preferences.statusMode,
+                                                         snmpPort: preferences.snmpPort)
+                    .flatMap { $0.pageCount == nil ? nil : $0 }
+                var sent: [(id: UUID, sheets: Int)] = []
+                var failure: Error?
                 do {
                     try PrintBatch.run(tasks, encoder: encoder) { event in
+                        if case .sent(let id, let sheets) = event { sent.append((id, sheets)) }
                         DispatchQueue.main.async { self?.handle(event) }
                     }
-                    DispatchQueue.main.async {
-                        self?.setBusy(false)
-                        self?.report("本批次数据发送完成，请确认实际出纸。未自动发送后来加入的文件。")
+                } catch { failure = error }
+                let delivered = sent
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.setBusy(false)
+                    if let error = failure {
+                        self.report("\(error.localizedDescription)\n已停止本批次，未发送的文件仍留在待处理列表。")
+                    } else if baseline == nil {
+                        self.report("本批次数据发送完成，请确认实际出纸。未自动发送后来加入的文件。")
                     }
-                } catch {
-                    DispatchQueue.main.async {
-                        self?.setBusy(false)
-                        self?.report("\(error.localizedDescription)\n已停止本批次，未发送的文件仍留在待处理列表。")
+                    if let baseline = baseline, !delivered.isEmpty {
+                        self.confirmPrinted(baseline: baseline, sent: delivered, preferences: preferences)
                     }
                 }
             }
@@ -614,11 +645,73 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         case .sent(let id, let sheets):
             if let file = jobs.first(where: { $0.id == id }) { file.state = .sent; file.error = nil }
             report("已发送 \(sheets) 页数据，请确认实际出纸。")
+        case .printed(let id):
+            if let file = jobs.first(where: { $0.id == id }) { file.state = .printed }
+        case .notice(let message): report(message)
         case .failed(let id, let error):
             if let file = jobs.first(where: { $0.id == id }) { file.state = .failed; file.error = error }
         }
         reloadList()
         flash.reloadResult()
+    }
+
+    private func confirmPrinted(baseline: PrinterStatusReport, sent: [(id: UUID, sheets: Int)],
+                                preferences: PrinterPreferences) {
+        let token = CancellationToken()
+        confirmation = token
+        let sheets = sent.reduce(0) { $0 + $1.sheets }
+        report("已发送 \(sheets) 页数据，正在通过打印机计数器确认出纸…")
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let done = PrintBatch.confirm(baseline: baseline.pageCount ?? 0, sent: sent, status: {
+                PrinterStatusClient.query(like: baseline, host: preferences.host, printPort: preferences.port,
+                                          interface: preferences.interface, snmpPort: preferences.snmpPort)
+            }, token: token) { event in
+                DispatchQueue.main.async { self?.handle(event) }
+            }
+            DispatchQueue.main.async {
+                guard let self = self, self.confirmation === token else { return }
+                self.confirmation = nil
+                if done { self.report("打印机已确认出纸 \(sheets) 页。") }
+                self.lastStatusQuery = .distantPast
+                self.refreshPrinterStatus()
+            }
+        }
+    }
+
+    @objc private func refreshPrinterStatus() {
+        let preferences = PrinterPreferences()
+        guard preferences.statusMode != .off, !preferences.host.isEmpty else {
+            showPrinterStatus(nil, enabled: false)
+            return
+        }
+        // Skip while printing or confirming: the queue reads the counter itself then.
+        guard !statusQuerying, !busy, confirmation == nil,
+              Date().timeIntervalSince(lastStatusQuery) > 10 else { return }
+        statusQuerying = true
+        lastStatusQuery = Date()
+        printerState.stringValue = "· 正在查询状态…"
+        printerState.textColor = .secondaryLabelColor
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let report = PrinterStatusClient.query(host: preferences.host, printPort: preferences.port,
+                                                   interface: preferences.interface, mode: preferences.statusMode,
+                                                   snmpPort: preferences.snmpPort)
+            DispatchQueue.main.async {
+                self?.statusQuerying = false
+                self?.showPrinterStatus(report, enabled: true)
+            }
+        }
+    }
+
+    private func showPrinterStatus(_ status: PrinterStatusReport?, enabled: Bool) {
+        var text = ""
+        if let status = status {
+            text = status.summary
+            if let display = status.display, display != status.state { text += "（面板：\(display)）" }
+        } else if enabled { text = "状态未知（不影响打印）" }
+        let severity = status?.severity ?? .ok
+        printerState.stringValue = text.isEmpty ? "" : "· \(text)"
+        printerState.textColor = severity == .error ? .systemRed : severity == .warning ? .systemOrange : .secondaryLabelColor
+        flash.setPrinterStatus(text, severity: severity)
     }
 
     private func report(_ message: String) {
@@ -764,6 +857,7 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         if window == nil { openingURLs.append(contentsOf: urls) }
         else { accept(urls) }
     }
+    func applicationDidBecomeActive(_ notification: Notification) { refreshPrinterStatus() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showMain()
         return true

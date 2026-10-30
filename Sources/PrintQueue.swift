@@ -6,6 +6,7 @@ enum PrintJobState: String {
     case preparing = "转换中"
     case sending = "发送中"
     case sent = "已发送"
+    case printed = "已出纸"
     case failed = "需检查"
 }
 
@@ -46,6 +47,15 @@ enum PrintBatchEvent {
     case progress(UUID, String)
     case sent(UUID, Int)
     case failed(UUID, String)
+    case printed(UUID)
+    case notice(String)
+}
+
+final class CancellationToken {
+    private let lock = NSLock()
+    private var value = false
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func cancel() { lock.lock(); value = true; lock.unlock() }
 }
 
 enum PrintBatch {
@@ -71,5 +81,49 @@ enum PrintBatch {
                 throw error
             }
         }
+    }
+
+    /// Watches the printer's page counter until the sent sheets have come out, in sending order.
+    /// Returns true when every job was confirmed. Other people's jobs on the same printer also
+    /// advance the counter, so this confirms "this many pages left the printer", not ownership.
+    @discardableResult
+    static func confirm(baseline: Int, sent: [(id: UUID, sheets: Int)],
+                        status: () -> PrinterStatusReport?, token: CancellationToken,
+                        interval: TimeInterval = 2, timeout: TimeInterval? = nil,
+                        wait: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
+                        event: (PrintBatchEvent) -> Void) -> Bool {
+        let total = sent.reduce(0) { $0 + $1.sheets }
+        // DCP-1600 series print about 20 pages a minute; allow warm-up and generous slack.
+        let limit = timeout ?? 45 + 8 * Double(total)
+        var waited: TimeInterval = 0
+        var confirmed = 0
+        var lastNotice = ""
+        while waited <= limit, !token.isCancelled {
+            if let report = status() {
+                if let count = report.pageCount {
+                    let printed = count - baseline
+                    var cumulative = 0
+                    for (index, job) in sent.enumerated() {
+                        cumulative += job.sheets
+                        if index >= confirmed && printed >= cumulative {
+                            event(.printed(job.id))
+                            confirmed = index + 1
+                        }
+                    }
+                    if confirmed == sent.count { return true }
+                }
+                let notice = report.severity == .error ? "打印机报告：\(report.summary)" : ""
+                if notice != lastNotice {
+                    if !notice.isEmpty { event(.notice(notice)) }
+                    lastNotice = notice
+                }
+            }
+            wait(interval)
+            waited += interval
+        }
+        if !token.isCancelled {
+            event(.notice("未能在预计时间内确认出纸（已确认 \(confirmed)/\(sent.count) 个文件），请到打印机旁检查。"))
+        }
+        return false
     }
 }

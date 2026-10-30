@@ -84,6 +84,8 @@ final class FlashDropController: NSObject {
     private var printButton: NSButton!
     private var trash: NSButton!
     private var busy = false
+    private var printerStatus = ""
+    private var printerSeverity = PrinterStatusReport.Severity.ok
     private var topLeft = NSPoint.zero
     private var screenNumber: NSNumber?
     private var hiding: DispatchWorkItem?
@@ -208,6 +210,12 @@ final class FlashDropController: NSObject {
         fitResult()
     }
 
+    func setPrinterStatus(_ text: String, severity: PrinterStatusReport.Severity) {
+        printerStatus = text
+        printerSeverity = severity
+        if stage == .result { reloadResult() }
+    }
+
     func setBusy(_ value: Bool) {
         busy = value
         reloadResult()
@@ -238,8 +246,11 @@ final class FlashDropController: NSObject {
         paperPopup.selectItem(at: PaperSize.allCases.firstIndex(of: setup.paper) ?? 0)
         qualityPopup.selectItem(at: PrintQuality.allCases.firstIndex(of: setup.quality) ?? 0)
         pageRow.isHidden = single == nil
-        printer.stringValue = printerSummary()
-        let sent = !files.isEmpty && files.allSatisfy { $0.state == .sent }
+        printer.stringValue = [printerSummary(), printerStatus].filter { !$0.isEmpty }.joined(separator: " · ")
+        printer.textColor = printerSeverity == .error ? .systemRed :
+            printerSeverity == .warning ? .systemOrange : .labelColor
+        printer.toolTip = printer.stringValue
+        let sent = !files.isEmpty && files.allSatisfy { $0.state == .sent || $0.state == .printed }
         printButton.title = sent ? "再次打印" : "打印"
         printButton.isEnabled = !busy && !files.isEmpty
         trash.isEnabled = !busy && !files.isEmpty

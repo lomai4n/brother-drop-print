@@ -361,57 +361,8 @@ enum PrintEngine {
 
     static func send(_ dataURL: URL, host: String, port: Int, interface: String = "",
                      progress: (String) -> Void) throws {
-        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
-        guard descriptor >= 0 else { throw socketError("无法创建打印连接") }
+        let descriptor = try connect(host: host, port: port, interface: interface)
         defer { close(descriptor) }
-        var noSignal: Int32 = 1
-        setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal,
-                   socklen_t(MemoryLayout<Int32>.size))
-        if !interface.isEmpty {
-            var index = if_nametoindex(interface)
-            guard index != 0 else {
-                throw PrintFailure(message: "选定的网卡已断开，未发送打印数据。")
-            }
-            guard setsockopt(descriptor, IPPROTO_IP, IP_BOUND_IF, &index,
-                             socklen_t(MemoryLayout<UInt32>.size)) == 0 else {
-                throw socketError("无法绑定选定网卡")
-            }
-        }
-        var address = sockaddr_in()
-        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        address.sin_family = sa_family_t(AF_INET)
-        guard (1...65535).contains(port),
-              host.withCString({ inet_pton(AF_INET, $0, &address.sin_addr) }) == 1 else {
-            throw PrintFailure(message: "打印地址或端口无效。")
-        }
-        address.sin_port = UInt16(port).bigEndian
-        let originalFlags = fcntl(descriptor, F_GETFL)
-        guard originalFlags >= 0, fcntl(descriptor, F_SETFL, originalFlags | O_NONBLOCK) == 0 else {
-            throw socketError("无法设置连接超时")
-        }
-        let connected = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        if connected != 0 {
-            guard errno == EINPROGRESS else { throw socketError("无法连接打印机") }
-            var event = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
-            guard poll(&event, 1, 5000) > 0 else {
-                throw PrintFailure(message: "连接超时，请检查打印机 IP、端口和路由器转发。")
-            }
-            var socketStatus: Int32 = 0
-            var length = socklen_t(MemoryLayout<Int32>.size)
-            guard getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &socketStatus, &length) == 0 else {
-                throw socketError("读取连接状态失败")
-            }
-            guard socketStatus == 0 else {
-                throw PrintFailure(message: "无法连接打印机：\(String(cString: strerror(socketStatus)))")
-            }
-        }
-        guard fcntl(descriptor, F_SETFL, originalFlags) == 0 else {
-            throw socketError("无法准备打印连接")
-        }
         var timeout = timeval(tv_sec: 15, tv_usec: 0)
         guard setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout,
                          socklen_t(MemoryLayout<timeval>.size)) == 0 else {
@@ -437,6 +388,65 @@ enum PrintEngine {
             progress("正在发送… \(ByteCountFormatter.string(fromByteCount: Int64(sent), countStyle: .file))")
         }
         shutdown(descriptor, SHUT_WR)
+    }
+
+    /// Opens a blocking TCP connection, bound to `interface` when one is given. The caller closes it.
+    static func connect(host: String, port: Int, interface: String = "",
+                        timeoutMilliseconds: Int32 = 5000) throws -> Int32 {
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw socketError("无法创建打印连接") }
+        var connected = false
+        defer { if !connected { close(descriptor) } }
+        var noSignal: Int32 = 1
+        setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal,
+                   socklen_t(MemoryLayout<Int32>.size))
+        if !interface.isEmpty {
+            var index = if_nametoindex(interface)
+            guard index != 0 else {
+                throw PrintFailure(message: "选定的网卡已断开，未发送打印数据。")
+            }
+            guard setsockopt(descriptor, IPPROTO_IP, IP_BOUND_IF, &index,
+                             socklen_t(MemoryLayout<UInt32>.size)) == 0 else {
+                throw socketError("无法绑定选定网卡")
+            }
+        }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        guard (1...65535).contains(port),
+              host.withCString({ inet_pton(AF_INET, $0, &address.sin_addr) }) == 1 else {
+            throw PrintFailure(message: "打印地址或端口无效。")
+        }
+        address.sin_port = UInt16(port).bigEndian
+        let originalFlags = fcntl(descriptor, F_GETFL)
+        guard originalFlags >= 0, fcntl(descriptor, F_SETFL, originalFlags | O_NONBLOCK) == 0 else {
+            throw socketError("无法设置连接超时")
+        }
+        let result = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if result != 0 {
+            guard errno == EINPROGRESS else { throw socketError("无法连接打印机") }
+            var event = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+            guard poll(&event, 1, timeoutMilliseconds) > 0 else {
+                throw PrintFailure(message: "连接超时，请检查打印机 IP、端口和路由器转发。")
+            }
+            var socketStatus: Int32 = 0
+            var length = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &socketStatus, &length) == 0 else {
+                throw socketError("读取连接状态失败")
+            }
+            guard socketStatus == 0 else {
+                throw PrintFailure(message: "无法连接打印机：\(String(cString: strerror(socketStatus)))")
+            }
+        }
+        guard fcntl(descriptor, F_SETFL, originalFlags) == 0 else {
+            throw socketError("无法准备打印连接")
+        }
+        connected = true
+        return descriptor
     }
 
     static func socketError(_ prefix: String) -> PrintFailure {

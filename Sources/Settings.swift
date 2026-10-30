@@ -6,6 +6,8 @@ struct PrinterPreferences {
     var port: Int
     var interface: String
     var automaticDropWindow: Bool
+    var statusMode: PrinterStatusMode
+    var snmpPort: Int
 
     init(defaults: UserDefaults = .standard) {
         host = defaults.string(forKey: "printerHost") ?? ""
@@ -13,10 +15,13 @@ struct PrinterPreferences {
         port = savedPort > 0 ? savedPort : 9100
         interface = defaults.string(forKey: "printerInterface") ?? ""
         automaticDropWindow = defaults.object(forKey: "automaticDropWindow") as? Bool ?? true
+        statusMode = defaults.string(forKey: "printerStatusMode").flatMap(PrinterStatusMode.init) ?? .snmpAndPJL
+        let savedSNMP = defaults.integer(forKey: "printerSNMPPort")
+        snmpPort = savedSNMP > 0 ? savedSNMP : 161
     }
 
     func save(to defaults: UserDefaults = .standard) throws {
-        guard (1...65535).contains(port) else {
+        guard (1...65535).contains(port), (1...65535).contains(snmpPort) else {
             throw PrintFailure(message: "端口必须在 1–65535 之间。")
         }
         if !host.isEmpty { try PrintOptions.validateAddress(host: host, port: port) }
@@ -24,6 +29,8 @@ struct PrinterPreferences {
         defaults.set(port, forKey: "printerPort")
         defaults.set(interface, forKey: "printerInterface")
         defaults.set(automaticDropWindow, forKey: "automaticDropWindow")
+        defaults.set(statusMode.rawValue, forKey: "printerStatusMode")
+        defaults.set(snmpPort, forKey: "printerSNMPPort")
     }
 }
 
@@ -34,6 +41,8 @@ final class SettingsController: NSObject {
     private let host = NSTextField()
     private let port = NSTextField()
     private let network = NSPopUpButton()
+    private let statusMode = NSPopUpButton()
+    private let snmpPort = NSTextField()
     private let automatic = NSButton(checkboxWithTitle: "拖动文件时自动显示接收浮窗", target: nil, action: nil)
     private let message = NSTextField(wrappingLabelWithString: "")
 
@@ -44,6 +53,8 @@ final class SettingsController: NSObject {
         host.stringValue = preferences.host
         port.stringValue = String(preferences.port)
         automatic.state = preferences.automaticDropWindow ? .on : .off
+        statusMode.selectItem(at: PrinterStatusMode.allCases.firstIndex(of: preferences.statusMode) ?? 1)
+        snmpPort.stringValue = String(preferences.snmpPort)
         network.removeAllItems()
         network.addItem(withTitle: "自动（系统路由）")
         network.lastItem?.representedObject = ""
@@ -58,13 +69,14 @@ final class SettingsController: NSObject {
             network.lastItem?.representedObject = preferences.interface
             network.select(network.lastItem)
         }
-        message.stringValue = "连接参数只保存在本机。绑定网卡不可用时，打印任务会停止，不改走其他网络。"
+        message.stringValue = "连接参数只保存在本机。绑定网卡不可用时，打印任务会停止，不改走其他网络。" +
+            "状态查询只读取打印机状态和页数计数器；打印机在另一台路由器后面时，需要另行转发 SNMP（UDP）端口。"
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
 
     private func build() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 510, height: 410),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 510, height: 500),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Brother Drop Print 设置"
         window.isReleasedWhenClosed = false
@@ -77,6 +89,11 @@ final class SettingsController: NSObject {
             view.widthAnchor.constraint(equalToConstant: 280).isActive = true
         }
         network.widthAnchor.constraint(equalToConstant: 280).isActive = true
+        statusMode.addItems(withTitles: PrinterStatusMode.allCases.map(\.label))
+        statusMode.setAccessibilityLabel("打印机状态查询")
+        statusMode.widthAnchor.constraint(equalToConstant: 280).isActive = true
+        snmpPort.setAccessibilityLabel("SNMP 端口")
+        snmpPort.widthAnchor.constraint(equalToConstant: 280).isActive = true
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
@@ -94,7 +111,9 @@ final class SettingsController: NSObject {
         let grid = NSGridView(views: [
             [NSTextField(labelWithString: "打印机 IP"), host],
             [NSTextField(labelWithString: "打印端口"), port],
-            [NSTextField(labelWithString: "发送网卡"), network]
+            [NSTextField(labelWithString: "发送网卡"), network],
+            [NSTextField(labelWithString: "状态查询"), statusMode],
+            [NSTextField(labelWithString: "SNMP 端口"), snmpPort]
         ])
         grid.columnSpacing = 16
         grid.rowSpacing = 12
@@ -102,7 +121,7 @@ final class SettingsController: NSObject {
         grid.column(at: 1).xPlacement = .leading
         root.addArrangedSubview(grid)
         root.addArrangedSubview(automatic)
-        message.maximumNumberOfLines = 3
+        message.maximumNumberOfLines = 4
         message.preferredMaxLayoutWidth = 450
         message.font = .systemFont(ofSize: 12)
         message.textColor = .secondaryLabelColor
@@ -127,6 +146,8 @@ final class SettingsController: NSObject {
         preferences.port = Int(port.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         preferences.interface = network.selectedItem?.representedObject as? String ?? ""
         preferences.automaticDropWindow = automatic.state == .on
+        preferences.statusMode = PrinterStatusMode.allCases[max(statusMode.indexOfSelectedItem, 0)]
+        preferences.snmpPort = Int(snmpPort.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         do {
             try preferences.save()
             onSaved?()

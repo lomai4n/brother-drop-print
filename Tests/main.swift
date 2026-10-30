@@ -334,4 +334,178 @@ if CommandLine.arguments.count > 1 {
         $0.range(of: Data("@PJL EOJ".utf8)) != nil && $0.starts(with: Data(repeating: 0, count: 128))
     }, "both received jobs have complete protocol boundaries")
 }
-print("Core checks passed: drag state, settings, file receipts, PDF/PNG rendering, TCP binding and batch delivery.")
+
+// Printer status: SNMP encoding, decoding and a loopback agent; PJL parsing; page-counter confirmation.
+func berLength(_ bytes: [UInt8], _ index: inout Int) -> Int {
+    let first = Int(bytes[index]); index += 1
+    guard first & 0x80 != 0 else { return first }
+    var value = 0
+    for _ in 0..<(first & 0x7f) { value = value << 8 | Int(bytes[index]); index += 1 }
+    return value
+}
+func snmpResponse(requestID: Int, bindings: [(String, [UInt8])]) -> [UInt8] {
+    let list = bindings.flatMap { SNMP.tlv(0x30, SNMP.oid($0.0) + $0.1) }
+    let pdu = SNMP.tlv(0xa2, SNMP.integer(requestID) + SNMP.integer(0) + SNMP.integer(0) + SNMP.tlv(0x30, list))
+    return SNMP.tlv(0x30, SNMP.integer(1) + SNMP.tlv(0x04, Array("public".utf8)) + pdu)
+}
+let statusBindings: [(String, [UInt8])] = [
+    (SNMP.printerStatus, SNMP.integer(3)),
+    (SNMP.deviceStatus, SNMP.integer(3)),
+    (SNMP.detectedErrorState, SNMP.tlv(0x04, [0x40])),
+    (SNMP.consoleDisplay, SNMP.tlv(0x04, Array("No Paper  ".utf8))),
+    (SNMP.pageCount, SNMP.tlv(0x41, [0x80, 0x00, 0x00, 0x05])),
+    (SNMP.tonerLevel, SNMP.integer(60)),
+    (SNMP.tonerCapacity, SNMP.integer(100))
+]
+expect(SNMP.oid("1.3.6.1.2.1.43.10.2.1.4.1.1") ==
+       [0x06, 0x0c, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x2b, 0x0a, 0x02, 0x01, 0x04, 0x01, 0x01],
+       "SNMP OID encoding")
+expect(SNMP.integer(128) == [0x02, 0x02, 0x00, 0x80] && SNMP.integer(-1) == [0x02, 0x01, 0xff],
+       "SNMP integer encoding keeps the sign")
+let parsedStatus = SNMP.parseResponse(snmpResponse(requestID: 77, bindings: statusBindings), requestID: 77)
+expect(SNMP.parseResponse(snmpResponse(requestID: 77, bindings: statusBindings), requestID: 78) == nil,
+       "SNMP responses to other requests are ignored")
+let snmpReport = parsedStatus.flatMap(SNMP.report)
+expect(snmpReport?.state == "就绪" && snmpReport?.problems == ["缺纸"] && snmpReport?.severity == .error,
+       "SNMP error bits become a readable problem")
+expect(snmpReport?.tonerPercent == 60 && snmpReport?.display == "No Paper" && snmpReport?.pageCount == 2_147_483_653,
+       "SNMP toner, panel text and unsigned page counter")
+let pjlReport = PJLStatus.report(from: "@PJL INFO STATUS\r\nCODE=41002\r\nDISPLAY=\"No Paper\"\r\nONLINE=FALSE\r\n\u{0c}")
+expect(pjlReport?.problems == ["缺纸"] && pjlReport?.severity == .error && pjlReport?.display == "No Paper",
+       "PJL INFO STATUS is parsed")
+// Recorded from the DCP-1618W on 2026-10-29.
+let recorded = PJLStatus.report(from: "@PJL INFO STATUS\r\nCODE=10001\r\nDISPLAY=\"准备就绪\"\r\nONLINE=TRUE\r\n\u{0c}" +
+                                 "@PJL INFO PAGECOUNT\r\nPAGECOUNT=5215\r\n\u{0c}")
+expect(recorded?.state == "就绪" && recorded?.display == "准备就绪" && recorded?.pageCount == 5215 &&
+       recorded?.severity == .ok, "recorded DCP-1618W PJL reply")
+expect(PJLStatus.report(from: "garbage") == nil, "non-PJL replies are ignored")
+
+let agent = socket(AF_INET, SOCK_DGRAM, 0)
+var agentAddress = sockaddr_in()
+agentAddress.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+agentAddress.sin_family = sa_family_t(AF_INET)
+agentAddress.sin_addr.s_addr = inet_addr("127.0.0.1")
+let agentBound = withUnsafePointer(to: &agentAddress) {
+    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        Darwin.bind(agent, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+    }
+}
+var agentSize = socklen_t(MemoryLayout<sockaddr_in>.size)
+_ = withUnsafeMutablePointer(to: &agentAddress) {
+    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(agent, $0, &agentSize) }
+}
+expect(agentBound == 0, "bind loopback SNMP agent")
+let agentPort = Int(UInt16(bigEndian: agentAddress.sin_port))
+var agentRequests = 0
+DispatchQueue.global().async {
+    var buffer = [UInt8](repeating: 0, count: 2048)
+    var peer = sockaddr_storage()
+    var peerSize = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    let count = withUnsafeMutablePointer(to: &peer) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            recvfrom(agent, &buffer, buffer.count, 0, $0, &peerSize)
+        }
+    }
+    guard count > 0 else { return }
+    agentRequests += 1
+    let request = Array(buffer[0..<count])
+    // SEQUENCE { version, community, GetRequest { request-id, ... } }
+    var index = 1
+    _ = berLength(request, &index)
+    index += 3
+    index += 1
+    index += berLength(request, &index)
+    guard request[index] == 0xa0 else { return }
+    index += 1
+    _ = berLength(request, &index)
+    index += 1
+    let idLength = berLength(request, &index)
+    let id = request[index..<index + idLength].reduce(0) { $0 << 8 | Int($1) }
+    let reply = snmpResponse(requestID: id, bindings: statusBindings)
+    _ = reply.withUnsafeBytes { bytes in
+        withUnsafePointer(to: &peer) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                sendto(agent, bytes.baseAddress, bytes.count, 0, $0, peerSize)
+            }
+        }
+    }
+}
+let liveReport = PrinterStatusClient.querySNMP(host: "127.0.0.1", port: agentPort, interface: "lo0")
+expect(liveReport?.problems == ["缺纸"] && liveReport?.pageCount == 2_147_483_653,
+       "SNMP status is read from a loopback agent through the selected interface")
+close(agent)
+expect(PrinterStatusClient.querySNMP(host: "127.0.0.1", port: agentPort, interface: "",
+                                     attempts: 1, timeoutMilliseconds: 200) == nil,
+       "a silent SNMP port means unknown status, not an error")
+expect(PrinterStatusClient.query(host: "127.0.0.1", printPort: 9100, interface: "", mode: .off) == nil,
+       "status queries are skipped when turned off")
+
+let firstSent = UUID()
+let secondSent = UUID()
+var counter = [100, 101, 101, 103].makeIterator()
+var confirmed: [UUID] = []
+let allPrinted = PrintBatch.confirm(baseline: 100, sent: [(firstSent, 1), (secondSent, 2)], status: {
+    counter.next().map { PrinterStatusReport(source: "SNMP", state: "打印中", pageCount: $0) }
+}, token: CancellationToken(), wait: { _ in }) { event in
+    if case .printed(let id) = event { confirmed.append(id) }
+}
+expect(allPrinted && confirmed == [firstSent, secondSent], "page counter confirms files in sending order")
+var notices: [String] = []
+let stalled = PrintBatch.confirm(baseline: 100, sent: [(firstSent, 1)], status: {
+    PrinterStatusReport(source: "SNMP", state: "就绪", problems: ["卡纸"], pageCount: 100, severity: .error)
+}, token: CancellationToken(), timeout: 4, wait: { _ in }) { event in
+    if case .notice(let message) = event { notices.append(message) }
+}
+expect(!stalled && notices.count == 2 && notices[0].contains("卡纸") && notices[1].contains("未能"),
+       "a stalled counter reports the printer problem once, then gives up")
+let cancelledToken = CancellationToken()
+cancelledToken.cancel()
+expect(!PrintBatch.confirm(baseline: 0, sent: [(firstSent, 1)], status: { nil }, token: cancelledToken,
+                           wait: { _ in }, event: { _ in }), "a newer batch cancels the old confirmation")
+let pjlListener = socket(AF_INET, SOCK_STREAM, 0)
+var pjlAddress = sockaddr_in()
+pjlAddress.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+pjlAddress.sin_family = sa_family_t(AF_INET)
+pjlAddress.sin_addr.s_addr = inet_addr("127.0.0.1")
+let pjlBound = withUnsafePointer(to: &pjlAddress) {
+    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        Darwin.bind(pjlListener, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+    }
+}
+var pjlSize = socklen_t(MemoryLayout<sockaddr_in>.size)
+_ = withUnsafeMutablePointer(to: &pjlAddress) {
+    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(pjlListener, $0, &pjlSize) }
+}
+expect(pjlBound == 0 && listen(pjlListener, 1) == 0, "bind loopback PJL printer")
+var pjlRequest = Data()
+DispatchQueue.global().async {
+    let peer = accept(pjlListener, nil, nil)
+    guard peer >= 0 else { return }
+    var chunk = [UInt8](repeating: 0, count: 512)
+    while pjlRequest.range(of: Data("INFO PAGECOUNT\r\n\u{1b}%-12345X".utf8)) == nil {
+        let count = recv(peer, &chunk, chunk.count, 0)
+        if count <= 0 { break }
+        pjlRequest.append(contentsOf: chunk.prefix(count))
+    }
+    let reply = Array(("@PJL INFO STATUS\r\nCODE=40021\r\nDISPLAY=\"Cover is Open\"\r\nONLINE=FALSE\r\n\u{0c}" +
+                       "@PJL INFO PAGECOUNT\r\nPAGECOUNT=5215\r\n\u{0c}").utf8)
+    _ = reply.withUnsafeBytes { Darwin.send(peer, $0.baseAddress, $0.count, 0) }
+    close(peer)
+}
+let pjlLive = PrinterStatusClient.query(host: "127.0.0.1", printPort: Int(UInt16(bigEndian: pjlAddress.sin_port)),
+                                        interface: "", mode: .snmpAndPJL, snmpPort: agentPort)
+close(pjlListener)
+expect(pjlLive?.source == "PJL" && pjlLive?.problems == ["机盖打开"] && pjlLive?.display == "Cover is Open" &&
+       pjlLive?.pageCount == 5215,
+       "PJL fallback reads status over the print port when SNMP is silent")
+expect(pjlRequest == Data(PJLStatus.query), "the PJL query sends only INFO STATUS and INFO PAGECOUNT")
+var statusDefaults = PrinterPreferences(defaults: preferencesStore)
+expect(statusDefaults.statusMode == .snmpAndPJL && statusDefaults.snmpPort == 161,
+       "status defaults to automatic SNMP, then PJL")
+statusDefaults.statusMode = .snmp
+statusDefaults.snmpPort = 10161
+try statusDefaults.save(to: preferencesStore)
+let reloadedStatus = PrinterPreferences(defaults: preferencesStore)
+expect(reloadedStatus.statusMode == .snmp && reloadedStatus.snmpPort == 10161, "status settings are saved")
+
+print("Core checks passed: drag state, settings, file receipts, PDF/PNG rendering, TCP binding, batch delivery and printer status.")

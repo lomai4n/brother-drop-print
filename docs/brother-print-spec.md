@@ -129,6 +129,26 @@ SNMP OID（UDP 161）：
   质量合并为标准 600 dpi、草稿 300 dpi、省墨 600 dpi 三档。
 - 未采用 ADK 的 PCL 纸张代码 `ESC&l#A`，继续用 brlaser 已验证的 `@PJL SET PAPER`。
 
+## 5b. 已实现（V1.2 第 3 步：状态与出纸确认）
+
+- 设置中的“状态查询”：不查询 / 仅 SNMP / 自动（默认：SNMP 不通时经打印端口查询 PJL，并记住上次回应的方式）。
+  SNMP 端口可改（默认 UDP 161，团体名 public，v2c）。
+- 读取的 OID：hrDeviceStatus、hrPrinterStatus、hrPrinterDetectedErrorState（缺纸、卡纸、机盖打开、碳粉等 15 种）、
+  面板文字 prtConsoleDisplayBufferText、页数计数器 prtMarkerLifeCount、碳粉余量 prtMarkerSuppliesLevel / MaxCapacity。
+  这些是标准 Printer MIB；第 5 节的 Brother 私有状态码表尚未恢复，暂不使用。
+- PJL 只发送 `@PJL INFO STATUS` 和 `@PJL INFO PAGECOUNT`，解析 CODE / DISPLAY / ONLINE / PAGECOUNT；
+  发送作业期间不做 PJL 查询，避免与作业争用打印端口。
+- 出纸确认：发送前读页数计数器作为基线，发送后每 2 秒用同一来源（SNMP 或 PJL）再读，按发送顺序把文件标为“已出纸”；
+  超时（45 秒 + 每页 8 秒）则提示到打印机旁检查。同一打印机上别人的作业也会推进计数器。
+- 发送的打印数据与第 2 步完全相同；状态查询失败只显示“状态未知”，不影响打印。
+- 本机测试用回环 SNMP 代理和 PJL 服务器验证。
+- 2026-10-29 实机（DCP-1618W，固件 `8C5-G02:Ver.D`，经 9100 端口访问）：
+  - SNMP v1 / v2c 均无回应；80、443、515、631 端口不通，只有 9100 可达。
+  - PJL 在 9100 上可回读：`INFO ID`、`INFO STATUS`（`CODE=10001`、`DISPLAY="准备就绪"`、`ONLINE=TRUE`，
+    面板文字为 UTF-8 中文；休眠时显示“休眠”）、`INFO PAGECOUNT`（`PAGECOUNT=5215`）。
+  - `INFO USTATUS` 显示 DEVICE / JOB / PAGE 主动回报默认关闭；本实现不开启，改用页数计数器轮询。
+  - **待核**：打印一份后计数器是否按页递增、作业处理中 PJL 查询的回应时机。
+
 ## 6. 实机验证清单（DCP-1618W）
 
 1. 测试页基线：保持当前头部，确认出纸与 V1.1 一致。
