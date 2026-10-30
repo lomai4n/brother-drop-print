@@ -12,7 +12,7 @@ if arguments.first == "--configure", (3...4).contains(arguments.count),
     exit(0)
 }
 let application = NSApplication.shared
-let delegate = MenuBarApp()
+let delegate = StandalonePrintApp()
 application.delegate = delegate
-application.setActivationPolicy(.accessory)
+application.setActivationPolicy(.regular)
 application.run()

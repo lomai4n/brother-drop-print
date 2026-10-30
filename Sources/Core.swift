@@ -56,7 +56,7 @@ struct PrintOptions {
     let fit: Bool
     var interface: String = ""
 
-    func validate(pageCount: Int) throws {
+    static func validateAddress(host: String, port: Int) throws {
         var address = in_addr()
         guard host.withCString({ inet_pton(AF_INET, $0, &address) }) == 1 else {
             throw PrintFailure(message: "请输入打印机或转发路由器的 IPv4 地址。")
@@ -64,12 +64,20 @@ struct PrintOptions {
         guard (1...65535).contains(port) else {
             throw PrintFailure(message: "端口必须在 1–65535 之间。")
         }
+    }
+
+    static func validatePages(copies: Int, firstPage: Int, lastPage: Int, pageCount: Int) throws {
         guard (1...99).contains(copies) else {
             throw PrintFailure(message: "份数必须在 1–99 之间。")
         }
         guard firstPage >= 1, lastPage >= firstPage, lastPage <= pageCount else {
             throw PrintFailure(message: "页码范围超出了文档页数。")
         }
+    }
+
+    func validate(pageCount: Int) throws {
+        try Self.validateAddress(host: host, port: port)
+        try Self.validatePages(copies: copies, firstPage: firstPage, lastPage: lastPage, pageCount: pageCount)
         guard interface.isEmpty || if_nametoindex(interface) != 0 else {
             throw PrintFailure(message: "选定的网卡不可用，请检查有线连接或重新选择网卡。")
         }
