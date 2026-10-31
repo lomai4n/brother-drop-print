@@ -18,8 +18,10 @@ struct PrintFailure: LocalizedError {
 
 struct PrintDocument {
     let url: URL
+    let printableURL: URL
     let pageCount: Int
     let isPDF: Bool
+    private let convertedStorage: ConvertedDocumentStorage?
 
     init(url: URL) throws {
         guard url.isFileURL,
@@ -27,22 +29,34 @@ struct PrintDocument {
             throw PrintFailure(message: "请拖入一个文件。")
         }
         let ext = url.pathExtension.lowercased()
-        if ext == "pdf" {
-            guard let pdf = CGPDFDocument(url as CFURL), pdf.isUnlocked,
+        let storage: ConvertedDocumentStorage?
+        let renderingURL: URL
+        if DocumentFormatSupport.officeExtensions.contains(ext) {
+            storage = try OfficeDocumentConverter.convert(url)
+            renderingURL = storage!.pdfURL
+        } else {
+            storage = nil
+            renderingURL = url
+        }
+        if ext == "pdf" || storage != nil {
+            guard let pdf = CGPDFDocument(renderingURL as CFURL), pdf.isUnlocked,
                   pdf.numberOfPages > 0 else {
-                throw PrintFailure(message: "PDF 无法读取或需要密码，请先解锁后再打印。")
+                throw PrintFailure(message: storage == nil ? "PDF 无法读取或需要密码，请先解锁后再打印。" :
+                    "转换后的 PDF 无法读取，请检查原文档是否损坏或需要密码。")
             }
             isPDF = true
             pageCount = pdf.numberOfPages
-        } else if ["png", "jpg", "jpeg"].contains(ext),
-                  let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+        } else if DocumentFormatSupport.imageExtensions.contains(ext),
+                  let source = CGImageSourceCreateWithURL(renderingURL as CFURL, nil),
                   CGImageSourceGetCount(source) > 0 {
             isPDF = false
             pageCount = 1
         } else {
-            throw PrintFailure(message: "支持 PDF、PNG 和 JPEG。其他文档请先导出为 PDF。")
+            throw PrintFailure(message: "不支持此文件格式。可打印 PDF、图片、Word、Excel、PowerPoint、OpenDocument、RTF、TXT 和 CSV。")
         }
         self.url = url
+        printableURL = renderingURL
+        convertedStorage = storage
     }
 }
 
@@ -490,7 +504,7 @@ enum PrintEngine {
                             y: CGFloat(height) / printableHeight)
             context.interpolationQuality = .high
             if document.isPDF {
-                guard let pdf = CGPDFDocument(document.url as CFURL), let page = pdf.page(at: number) else {
+                guard let pdf = CGPDFDocument(document.printableURL as CFURL), let page = pdf.page(at: number) else {
                     throw PrintFailure(message: "无法读取 PDF 页面。")
                 }
                 let box = page.getBoxRect(.cropBox)
@@ -515,7 +529,7 @@ enum PrintEngine {
                     kCGImageSourceCreateThumbnailWithTransform: true,
                     kCGImageSourceThumbnailMaxPixelSize: max(width, height)
                 ]
-                guard let source = CGImageSourceCreateWithURL(document.url as CFURL, nil),
+                guard let source = CGImageSourceCreateWithURL(document.printableURL as CFURL, nil),
                       let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
                     throw PrintFailure(message: "无法读取图片。")
                 }
@@ -536,7 +550,7 @@ enum PrintEngine {
         let width = setup.width
         let height = setup.height
         let printable = setup.printableSize
-        let pdf = document.isPDF ? CGPDFDocument(document.url as CFURL) : nil
+        let pdf = document.isPDF ? CGPDFDocument(document.printableURL as CFURL) : nil
         var image: CGImage?
         if !document.isPDF {
             let options: [CFString: Any] = [
@@ -544,7 +558,7 @@ enum PrintEngine {
                 kCGImageSourceCreateThumbnailWithTransform: true,
                 kCGImageSourceThumbnailMaxPixelSize: max(width, height)
             ]
-            if let source = CGImageSourceCreateWithURL(document.url as CFURL, nil) {
+            if let source = CGImageSourceCreateWithURL(document.printableURL as CFURL, nil) {
                 image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
             }
         }

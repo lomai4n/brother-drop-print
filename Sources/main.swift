@@ -14,5 +14,6 @@ if arguments.first == "--configure", (3...4).contains(arguments.count),
 let application = NSApplication.shared
 let delegate = StandalonePrintApp()
 application.delegate = delegate
-application.setActivationPolicy(.regular)
+let backgroundMode = Bundle.main.object(forInfoDictionaryKey: "BrotherDropPrintBackground") as? Bool ?? false
+application.setActivationPolicy(backgroundMode ? .accessory : .regular)
 application.run()

@@ -4,6 +4,7 @@ import PDFKit
 import ImageIO
 import QuartzCore
 import OSLog
+import UniformTypeIdentifiers
 
 final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegate,
                                  NSTableViewDataSource, NSTableViewDelegate {
@@ -31,7 +32,7 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
     private var lastStatusQuery = Date.distantPast
     private var confirmation: CancellationToken?
     private let filename = NSTextField(labelWithString: "尚未选择文件")
-    private let status = NSTextField(wrappingLabelWithString: "拖入 PDF 或图片，选择参数后打印。")
+    private let status = NSTextField(wrappingLabelWithString: "拖入 PDF、图片或办公文档，选择参数后打印。")
     private let progress = NSProgressIndicator()
     private let copies = NSTextField(string: "1")
     private let firstPage = NSTextField(string: "1")
@@ -53,6 +54,9 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
     private var suppressSelection = false
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "org.brotherdropprint.app",
                                 category: "drag")
+    private var backgroundMode: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "BrotherDropPrintBackground") as? Bool ?? false
+    }
 
     private var selectedJob: QueuedPrintFile? { jobs.first { $0.id == selectedID } }
 
@@ -71,9 +75,9 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         wireFlash()
         wireDrop(dropArea)
         refreshPreferences()
-        if openingURLs.isEmpty { showMain() }
+        if openingURLs.isEmpty && !backgroundMode { showMain() }
         else {
-            accept(openingURLs)
+            if !openingURLs.isEmpty { accept(openingURLs) }
             openingURLs.removeAll()
         }
     }
@@ -237,7 +241,7 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         dropIcon.heightAnchor.constraint(equalToConstant: 28).isActive = true
         let dropTitle = NSTextField(labelWithString: "拖入文件，接着选择怎么打印")
         dropTitle.font = .systemFont(ofSize: 15, weight: .semibold)
-        let help = NSTextField(labelWithString: "PDF、PNG、JPEG · 可多选 · 也可拖到自动出现的接收浮窗")
+        let help = NSTextField(labelWithString: "PDF、图片、Word、Excel、PowerPoint 等 · 可多选")
         help.textColor = .secondaryLabelColor
         help.font = .systemFont(ofSize: 11)
         let dropText = NSStackView(views: [dropTitle, help])
@@ -395,6 +399,8 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         root.layer?.masksToBounds = true
         pdf.autoScales = true
         pdf.displayMode = .singlePageContinuous
+        pdf.displayBox = .mediaBox
+        pdf.displaysPageBreaks = true
         pdf.backgroundColor = .controlBackgroundColor
         pdf.unregisterDraggedTypes()
         image.imageScaling = .scaleProportionallyUpOrDown
@@ -439,19 +445,43 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         // A delayed file-promise receipt must not interrupt a newer drag gesture.
         if !intoFlash && NSEvent.pressedMouseButtons & 1 == 0 { showMain() }
         if !busy { try? storeForm() }
+        status.stringValue = urls.contains { DocumentFormatSupport.officeExtensions.contains($0.pathExtension.lowercased()) }
+            ? "正在本机转换办公文档…" : "正在读取文件…"
+        let existingURLs = Set(jobs.map { $0.document.url.standardizedFileURL })
+        let candidates = urls.filter { !existingURLs.contains($0.standardizedFileURL) }
+        let duplicateURL = urls.first { existingURLs.contains($0.standardizedFileURL) }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let results: [(URL, Result<PrintDocument, Error>)] = candidates.map { url in
+                do { return (url, .success(try PrintDocument(url: url))) }
+                catch { return (url, .failure(error)) }
+            }
+            DispatchQueue.main.async {
+                self?.finishAccept(results, duplicateURL: duplicateURL, requestedCount: urls.count,
+                                   intoFlash: intoFlash)
+            }
+        }
+    }
+
+    private func finishAccept(_ results: [(URL, Result<PrintDocument, Error>)], duplicateURL: URL?,
+                              requestedCount: Int, intoFlash: Bool) {
         var imported: [QueuedPrintFile] = []
         var errors: [String] = []
-        var existing: QueuedPrintFile?
-        for url in urls {
+        var existing = duplicateURL.flatMap { duplicateURL in
+            jobs.first { $0.document.url.standardizedFileURL == duplicateURL.standardizedFileURL }
+        }
+        for (url, result) in results {
             if let duplicate = jobs.first(where: { $0.document.url.standardizedFileURL == url.standardizedFileURL }) {
                 existing = duplicate
                 continue
             }
-            do {
-                let file = QueuedPrintFile(document: try PrintDocument(url: url))
+            switch result {
+            case .success(let document):
+                let file = QueuedPrintFile(document: document)
                 jobs.append(file)
                 imported.append(file)
-            } catch { errors.append("\(url.lastPathComponent)：\(error.localizedDescription)") }
+            case .failure(let error):
+                errors.append("\(url.lastPathComponent)：\(error.localizedDescription)")
+            }
         }
         reloadList()
         if let file = imported.first ?? existing, let index = jobs.firstIndex(where: { $0.id == file.id }) {
@@ -470,7 +500,7 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
             status.stringValue = busy ? "已加入 \(imported.count) 个文件，将留在列表中等待下一批打印。" :
                 "已添加 \(imported.count) 个文件。可预览、调整参数，再打印所选或全部待处理文件。"
         } else if existing != nil { status.stringValue = "文件已在列表中，可选中后再次打印。" }
-        logger.notice("documents_received count=\(urls.count, privacy: .public)")
+        logger.notice("documents_received count=\(requestedCount, privacy: .public)")
         updateControls()
     }
 
@@ -490,9 +520,9 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
             fit.state = file.fit ? .on : .off
             show(file.setup)
             if file.document.isPDF {
-                pdf.document = PDFDocument(url: file.document.url)
+                pdf.document = PDFDocument(url: file.document.printableURL)
                 pdf.isHidden = false
-            } else if let source = CGImageSourceCreateWithURL(file.document.url as CFURL, nil),
+            } else if let source = CGImageSourceCreateWithURL(file.document.printableURL as CFURL, nil),
                       let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                         kCGImageSourceCreateThumbnailFromImageAlways: true,
                         kCGImageSourceCreateThumbnailWithTransform: true,
@@ -624,7 +654,9 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
         let panel = NSOpenPanel()
         fileChooser = panel
-        panel.allowedContentTypes = [.pdf, .png, .jpeg]
+        panel.allowedContentTypes = DocumentFormatSupport.supportedExtensions.compactMap {
+            UTType(filenameExtension: $0)
+        }
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.beginSheetModal(for: window) { [weak self] result in
@@ -660,7 +692,9 @@ final class StandalonePrintApp: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     private func chooseFilesForFlash() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.pdf, .png, .jpeg]
+        panel.allowedContentTypes = DocumentFormatSupport.supportedExtensions.compactMap {
+            UTType(filenameExtension: $0)
+        }
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         NSApp.activate(ignoringOtherApps: true)

@@ -37,6 +37,55 @@ for _ in 0..<2 {
 pdfContext.closePDF()
 let document = try PrintDocument(url: pdfURL)
 expect(document.pageCount == 2 && document.isPDF, "PDF page count")
+expect(document.url == pdfURL && document.printableURL == pdfURL, "native PDF keeps its source URL")
+expect(OfficeDocumentConverter.fontSubstitutionXML.contains("宋体") &&
+       OfficeDocumentConverter.fontSubstitutionXML.contains("微软雅黑") &&
+       OfficeDocumentConverter.fontSubstitutionXML.contains("Songti SC") &&
+       OfficeDocumentConverter.fontSubstitutionXML.contains("Heiti SC"),
+       "office conversion configures bundled Chinese font substitutions")
+let fontconfig = OfficeDocumentConverter.fontconfigXML(fontDirectories: [folder],
+                                                        cacheDirectory: folder.appendingPathComponent("cache"))
+expect(fontconfig.contains(folder.path) && fontconfig.contains("<cachedir>"),
+       "office conversion exposes bundled fonts through fontconfig")
+expect(FlashDropController.thumbnail(for: document, page: 0) != nil &&
+       FlashDropController.thumbnail(for: document, page: 1) != nil,
+       "floating preview can render every PDF page")
+
+let fakeSoffice = folder.appendingPathComponent("fake-soffice")
+let fakeScript = """
+#!/bin/sh
+out=""
+source=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--outdir" ]; then
+    shift
+    out="$1"
+  else
+    source="$1"
+  fi
+  shift
+done
+base="$(basename "$source")"
+cp "$source" "$out/${base%.*}.pdf"
+"""
+try Data(fakeScript.utf8).write(to: fakeSoffice)
+try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeSoffice.path)
+let officeURL = folder.appendingPathComponent("quarterly report.docx")
+try Data(contentsOf: pdfURL).write(to: officeURL)
+setenv("BROTHER_DROP_PRINT_SOFFICE", fakeSoffice.path, 1)
+var convertedDirectory: URL?
+do {
+    let officeDocument = try PrintDocument(url: officeURL)
+    convertedDirectory = officeDocument.printableURL.deletingLastPathComponent().deletingLastPathComponent()
+    expect(officeDocument.url == officeURL && officeDocument.printableURL != officeURL,
+           "office document preserves source and uses a converted PDF")
+    expect(officeDocument.pageCount == 2 && officeDocument.isPDF, "converted office PDF page count")
+    expect(FileManager.default.fileExists(atPath: officeDocument.printableURL.path),
+           "converted PDF exists while document is retained")
+}
+unsetenv("BROTHER_DROP_PRINT_SOFFICE")
+expect(convertedDirectory.map { !FileManager.default.fileExists(atPath: $0.path) } == true,
+       "converted document directory is removed after release")
 let valid = PrintOptions(host: "192.0.2.10", port: 9100, copies: 1, firstPage: 1, lastPage: 2,
                          rotate: false, fit: true)
 try valid.validate(pageCount: 2)
@@ -171,8 +220,12 @@ expect(FileDropView.unsupportedReason(dragBoard) == nil, "supported files are no
 dragBoard.clearContents()
 dragBoard.writeObjects([folder.appendingPathComponent("unsupported.docx") as NSURL])
 expect(FileDropView.fileURLs(dragBoard).count == 1, "local file payload is received before format validation")
-expect(FileDropView.unsupportedReason(dragBoard)?.contains(".docx") == true,
-       "the flash card rejects an unsupported document before the drop")
+expect(FileDropView.unsupportedReason(dragBoard) == nil,
+       "the flash card accepts a supported office document")
+dragBoard.clearContents()
+dragBoard.writeObjects([folder.appendingPathComponent("unsupported.xyz") as NSURL])
+expect(FileDropView.unsupportedReason(dragBoard)?.contains(".xyz") == true,
+       "the flash card rejects an unsupported file before the drop")
 dragBoard.writeObjects([pdfURL as NSURL])
 expect(FileDropView.unsupportedReason(dragBoard) == nil, "a mixed drag with one printable file is accepted")
 dragBoard.clearContents()

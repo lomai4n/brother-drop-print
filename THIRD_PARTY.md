@@ -13,3 +13,9 @@ vendor binary, or Brother installation package is installed or redistributed.
 
 The upstream DCP-1600 / DCP-1610W profile supplies the initial A4 geometry.
 It is not a substitute for DCP-1618W hardware calibration.
+
+Noto Sans CJK SC and Noto Serif CJK SC are from
+[notofonts/noto-cjk](https://github.com/notofonts/noto-cjk).
+Copyright The Noto Project Authors.
+License: SIL Open Font License 1.1. The complete license is included at
+`Fonts/OFL.txt` in the application resources.

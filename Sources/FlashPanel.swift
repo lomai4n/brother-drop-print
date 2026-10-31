@@ -75,6 +75,10 @@ final class FlashDropController: NSObject {
     private let paper = NSImageView()
     private let cardHint = NSTextField(labelWithString: "")
     private let thumbnail = NSImageView()
+    private let thumbnailPageLabel = NSTextField(labelWithString: "")
+    private var previousThumbnailPage: NSButton!
+    private var nextThumbnailPage: NSButton!
+    private var thumbnailPage = 0
     private let name = NSTextField(labelWithString: "")
     private let detail = NSTextField(labelWithString: "")
     private let copies = NSTextField(string: "1")
@@ -106,7 +110,7 @@ final class FlashDropController: NSObject {
     private var carousel: Timer?
     private var carouselIndex = 0
     private let carouselTexts = ["文件拖到这，直接用 Brother 打印", "PDF、图片拖到这儿，即可打印"]
-    private let cardHintText = "支持 PDF、PNG、JPEG · 本机转换，不经云端"
+    private let cardHintText = "支持 PDF、图片和办公文档 · 本机转换，不经云端"
     private let width: CGFloat = 300
     private let pillSize = NSSize(width: 292, height: 36)
     private let cardHeight: CGFloat = 384
@@ -216,6 +220,7 @@ final class FlashDropController: NSObject {
     // MARK: Result content
 
     func add(_ received: [QueuedPrintFile]) {
+        if files.isEmpty && !received.isEmpty { thumbnailPage = 0 }
         for file in received where !files.contains(where: { $0.id == file.id }) {
             if let preset = pendingPreset { file.setup = preset.setup }
             files.append(file)
@@ -247,8 +252,26 @@ final class FlashDropController: NSObject {
 
     func reloadResult() {
         let single = files.count == 1 ? files[0] : nil
-        if let first = files.first { thumbnail.image = Self.thumbnail(for: first.document) }
+        let previewDocument = files.count == 1 ? files.first?.document : nil
+        if let document = previewDocument {
+            thumbnailPage = min(thumbnailPage, max(0, document.pageCount - 1))
+            thumbnail.image = Self.thumbnail(for: document, page: thumbnailPage)
+        } else if let first = files.first {
+            thumbnailPage = 0
+            thumbnail.image = Self.thumbnail(for: first.document)
+        }
         else { thumbnail.image = NSImage(systemSymbolName: "doc", accessibilityDescription: nil) }
+        let canTurnPages = previewDocument?.isPDF == true && (previewDocument?.pageCount ?? 0) > 1
+        previousThumbnailPage.isHidden = !canTurnPages
+        nextThumbnailPage.isHidden = !canTurnPages
+        thumbnailPageLabel.isHidden = previewDocument == nil
+        previousThumbnailPage.isEnabled = thumbnailPage > 0
+        nextThumbnailPage.isEnabled = thumbnailPage + 1 < (previewDocument?.pageCount ?? 0)
+        if let document = previewDocument {
+            thumbnailPageLabel.stringValue = document.pageCount > 1
+                ? "第 \(thumbnailPage + 1) / \(document.pageCount) 页"
+                : "完整页面预览"
+        }
         let bytes = files.reduce(Int64(0)) { total, file in
             total + Int64((try? file.document.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }
@@ -633,12 +656,22 @@ final class FlashDropController: NSObject {
             self.hide()
         }
         thumbnail.imageScaling = .scaleProportionallyUpOrDown
-        thumbnail.setAccessibilityLabel("首页预览")
+        thumbnail.setAccessibilityLabel("文档页面预览")
+        thumbnailPageLabel.font = .systemFont(ofSize: 10, weight: .medium)
+        thumbnailPageLabel.textColor = .secondaryLabelColor
+        thumbnailPageLabel.alignment = .center
+        previousThumbnailPage = iconButton("chevron.left", label: "上一页") { [weak self] in
+            self?.changeThumbnailPage(by: -1)
+        }
+        nextThumbnailPage = iconButton("chevron.right", label: "下一页") { [weak self] in
+            self?.changeThumbnailPage(by: 1)
+        }
         let box = NSView()
         box.wantsLayer = true
         box.layer?.cornerRadius = 10
         box.layer?.backgroundColor = NSColor.quaternaryLabelColor.withAlphaComponent(0.08).cgColor
-        for view in [add, trash!, thumbnail] as [NSView] {
+        for view in [add, trash!, thumbnail, thumbnailPageLabel,
+                     previousThumbnailPage!, nextThumbnailPage!] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             box.addSubview(view)
         }
@@ -651,7 +684,13 @@ final class FlashDropController: NSObject {
             thumbnail.centerXAnchor.constraint(equalTo: box.centerXAnchor),
             thumbnail.centerYAnchor.constraint(equalTo: box.centerYAnchor),
             thumbnail.heightAnchor.constraint(equalToConstant: 112),
-            thumbnail.widthAnchor.constraint(equalToConstant: 112)
+            thumbnail.widthAnchor.constraint(equalToConstant: 112),
+            thumbnailPageLabel.centerXAnchor.constraint(equalTo: box.centerXAnchor),
+            thumbnailPageLabel.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -4),
+            previousThumbnailPage.centerYAnchor.constraint(equalTo: thumbnail.centerYAnchor),
+            previousThumbnailPage.trailingAnchor.constraint(equalTo: thumbnail.leadingAnchor, constant: -10),
+            nextThumbnailPage.centerYAnchor.constraint(equalTo: thumbnail.centerYAnchor),
+            nextThumbnailPage.leadingAnchor.constraint(equalTo: thumbnail.trailingAnchor, constant: 10)
         ])
         full(box)
 
@@ -725,7 +764,7 @@ final class FlashDropController: NSObject {
         printer.lineBreakMode = .byTruncatingTail
         full(NSStackView(views: [label("打印机"), printer, spacer()]))
 
-        let preview = ClosureButton(title: "预览", handler: { [weak self] in self?.onPreview?() })
+        let preview = ClosureButton(title: "查看完整内容", handler: { [weak self] in self?.onPreview?() })
         preview.bezelStyle = .rounded
         printButton = ClosureButton(title: "打印", handler: { [weak self] in self?.printTapped() })
         printButton.bezelStyle = .rounded
@@ -740,6 +779,12 @@ final class FlashDropController: NSObject {
     }
 
     @objc private func stepped() { copies.stringValue = String(stepper.integerValue) }
+
+    private func changeThumbnailPage(by amount: Int) {
+        guard files.count == 1 else { return }
+        thumbnailPage = min(max(0, thumbnailPage + amount), files[0].document.pageCount - 1)
+        reloadResult()
+    }
 
     @objc private func setupChosen(_ sender: NSControl) {
         guard !files.isEmpty else { return }
@@ -816,13 +861,13 @@ final class FlashDropController: NSObject {
         } catch { status.stringValue = error.localizedDescription }
     }
 
-    static func thumbnail(for document: PrintDocument) -> NSImage? {
+    static func thumbnail(for document: PrintDocument, page pageIndex: Int = 0) -> NSImage? {
         if document.isPDF {
             // Keep the document alive while its page draws.
-            guard let pdf = PDFDocument(url: document.url), let page = pdf.page(at: 0) else { return nil }
+            guard let pdf = PDFDocument(url: document.printableURL), let page = pdf.page(at: pageIndex) else { return nil }
             return page.thumbnail(of: NSSize(width: 224, height: 224), for: .mediaBox)
         }
-        guard let source = CGImageSourceCreateWithURL(document.url as CFURL, nil),
+        guard let source = CGImageSourceCreateWithURL(document.printableURL as CFURL, nil),
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,

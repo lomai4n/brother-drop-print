@@ -124,7 +124,7 @@ final class FileDropView: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         setAccessibilityLabel("文件拖放区")
-        setAccessibilityHelp("拖入 PDF、PNG 或 JPEG，打开文档预览和打印操作。")
+        setAccessibilityHelp("拖入 PDF、图片或办公文档，打开文档预览和打印操作。")
         style()
     }
     required init?(coder: NSCoder) { nil }
@@ -152,10 +152,10 @@ final class FileDropView: NSView {
     static func unsupportedReason(_ pasteboard: NSPasteboard) -> String? {
         let urls = fileURLs(pasteboard)
         guard !urls.isEmpty,
-              !urls.contains(where: { ["pdf", "png", "jpg", "jpeg"].contains($0.pathExtension.lowercased()) })
+              !urls.contains(where: DocumentFormatSupport.supports)
         else { return nil }
         let ext = urls[0].pathExtension.isEmpty ? "此类文件" : ".\(urls[0].pathExtension)"
-        return "暂不支持 \(ext)，请先导出为 PDF"
+        return "暂不支持 \(ext)"
     }
 
     static func validReceivedURL(_ url: URL, directory: URL) -> Bool {
